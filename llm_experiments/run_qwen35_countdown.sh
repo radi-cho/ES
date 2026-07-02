@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # EGGROLL countdown with Qwen3.5-2B (JAX/HyperscaleES, single GPU).
-# Uses countdown.json chat/XML format (same as eggroll-vllm) for ~0.3 base score.
+# Uses countdown.json chat/XML format (same as eggroll-vllm). Expect epoch-0 val ~0.30 with thinking-length 1024.
 #
 # First-time setup:
 #   cd /home/siana/HyperscaleES_v2_rwkv_qwen
@@ -39,6 +39,7 @@ exec "$VENV_PYTHON" -m llm_experiments.general_do_evolution \
   --seed 0 \
   --temperature 0.0 \
   --parallel-validations 64 \
+  --validation-iterations 10 \
   --thinking-length 1024 \
   --answer-length 0 \
   --validate-every 5

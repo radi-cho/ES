@@ -158,7 +158,7 @@ class Qwen35Tokenizer(BaseTokenizer):
         self.tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B", trust_remote_code=True)
 
     def encode(self, src):
-        return self.tok.encode(src)
+        return self.tok.encode(src, add_special_tokens=False)
 
     def decode(self, tokens):
         return self.tok.decode(tokens)
@@ -169,6 +169,12 @@ class Qwen35Tokenizer(BaseTokenizer):
         if self.tok.eos_token_id is not None:
             return int(self.tok.eos_token_id)
         return 0
+
+    def generation_stop_ids(self):
+        stop = {0, self.pad_token_id()}
+        if self.tok.eos_token_id is not None:
+            stop.add(int(self.tok.eos_token_id))
+        return stop
 
 
 class Qwen25InstructTokenizer(BaseTokenizer):

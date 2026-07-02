@@ -61,6 +61,47 @@ def decode_tokens(tokens, tokenizer):
         return ""
 
 
+def _generation_stop_ids(tokenizer):
+    if hasattr(tokenizer, "generation_stop_ids"):
+        return tokenizer.generation_stop_ids()
+    stop = {0}
+    inner = getattr(tokenizer, "tok", None)
+    if inner is not None:
+        if inner.eos_token_id is not None:
+            stop.add(int(inner.eos_token_id))
+        if inner.pad_token_id is not None:
+            stop.add(int(inner.pad_token_id))
+    return stop
+
+
+def decode_generation_tokens(tokens, tokenizer):
+    """Decode generated tokens, stripping trailing pad markers only."""
+    try:
+        stop_ids = _generation_stop_ids(tokenizer)
+        arr = np.asarray(tokens, dtype=np.int32)
+        while arr.size > 0 and int(arr[-1]) in stop_ids:
+            arr = arr[:-1]
+        return tokenizer.decode(arr.tolist())
+    except BaseException:
+        return ""
+
+
+def _extract_countdown_chat_generation(context, tok_seq, prompt_len, tokenizer):
+    """Extract model continuation; prefer string split to avoid token-boundary drift."""
+    gen_tokens = np.asarray(tok_seq[prompt_len:], dtype=np.int32)
+    stop_ids = _generation_stop_ids(tokenizer)
+    while gen_tokens.size > 0 and int(gen_tokens[-1]) in stop_ids:
+        gen_tokens = gen_tokens[:-1]
+
+    prompt_tokens = np.asarray(tok_seq[:prompt_len], dtype=np.int32)
+    full = decode_tokens(np.concatenate([prompt_tokens, gen_tokens]), tokenizer)
+    if full.startswith(context):
+        generation_from_text = full[len(context):]
+        if generation_from_text.strip():
+            return generation_from_text
+    return decode_tokens(gen_tokens, tokenizer)
+
+
 def get_padded_prompt(single_prompt, generation_length):
     single_prompt = single_prompt[:generation_length]
     return single_prompt + [0] * (generation_length - len(single_prompt))
@@ -524,10 +565,13 @@ def _load_countdown_json_dataset(seed: int, dataset_size: int | None = None):
     return ds
 
 
+_COUNTDOWN_CHAT_THINK_CLOSE = r"(?:<\/think>|<\/redacted_thinking>)"
+
+
 def _countdown_chat_format_reward(response: str) -> float:
-    think_regex = r"<think>.*?<\/think>"
+    think_regex = rf"<think>.*?{_COUNTDOWN_CHAT_THINK_CLOSE}"
     answer_regex = r"<answer>.*?<\/answer>"
-    full_format_regex = r"^<think>.*?<\/think>\n<answer>.*?<\/answer>$"
+    full_format_regex = rf"^<think>.*?{_COUNTDOWN_CHAT_THINK_CLOSE}\n<answer>.*?<\/answer>$"
 
     think_match = re.search(think_regex, response, re.DOTALL)
     answer_match = re.search(answer_regex, response, re.DOTALL)
@@ -584,7 +628,7 @@ class CountdownChatTrain(BanditTask):
     """Countdown with eggroll-vllm chat/XML prompt format (countdown.json)."""
 
     def __init__(self, encoding_tokenizer, decoding_tokenizer, max_num_steps,
-                 dataset_size=256, seed=42):
+                 dataset_size=256, seed=0):
         super().__init__(encoding_tokenizer, decoding_tokenizer, max_num_steps)
         self.dataset = _load_countdown_json_dataset(seed=seed, dataset_size=dataset_size)
         self.dataset_size = len(self.dataset)
@@ -610,14 +654,16 @@ class CountdownChatTrain(BanditTask):
             target = example["target"]
             context = example["context"]
             prompt_len = len(self.encoding_tokenizer.encode(context))
-            generation = decode_tokens(tok_seq[prompt_len:], self.decoding_tokenizer)
+            generation = _extract_countdown_chat_generation(
+                context, tok_seq, prompt_len, self.decoding_tokenizer
+            )
             rewards.append(_countdown_chat_score_generation(generation, numbers, target))
         return jnp.array(rewards, dtype=jnp.float32)
 
 
 class CountdownChatVal(CountdownChatTrain):
     def __init__(self, encoding_tokenizer, decoding_tokenizer, max_num_steps,
-                 dataset_size=256, seed=1337):
+                 dataset_size=256, seed=12345):
         super().__init__(encoding_tokenizer, decoding_tokenizer, max_num_steps,
                          dataset_size=dataset_size, seed=seed)
 
