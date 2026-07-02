@@ -114,7 +114,7 @@ def build_validate(MODEL, config, params_example, base_evo_keys, master_gen_key,
             val_ds = getattr(args, "val_dataset_size", None) or 256
             validation_task = val_cls(
                 tokenizer, legacy_tokenizer, args.generation_length,
-                dataset_size=val_ds, seed=12345,
+                dataset_size=val_ds, val_holdout_size=val_ds,
             )
         else:
             validation_task = val_cls(tokenizer, legacy_tokenizer, args.generation_length)

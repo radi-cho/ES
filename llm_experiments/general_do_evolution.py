@@ -91,6 +91,7 @@ class Args:
     train_dataset_size: Optional[int] = None
     val_dataset_size: Optional[int] = None
     time_budget_seconds: Optional[float] = None
+    random_train_prompts: bool = False
 
     coord_addr: Optional[str] = None
     num_procs: Optional[int] = None
@@ -159,7 +160,7 @@ config, params, scan_map, es_map = full_params
 
 args.prompts_per_epoch = args.total_parallel_generations // args.generations_per_prompt
 
-def _task_kwargs(task_name: str, *, dataset_size: Optional[int], seed: Optional[int]) -> dict:
+def _task_kwargs(task_name: str, *, dataset_size: Optional[int], seed: Optional[int], val_holdout_size: Optional[int] = None) -> dict:
     if task_name != "countdown_chat":
         return {}
     kwargs = {}
@@ -167,16 +168,30 @@ def _task_kwargs(task_name: str, *, dataset_size: Optional[int], seed: Optional[
         kwargs["dataset_size"] = dataset_size
     if seed is not None:
         kwargs["seed"] = seed
+    if val_holdout_size is not None:
+        kwargs["val_holdout_size"] = val_holdout_size
     return kwargs
 
 train_ds = args.train_dataset_size if args.train_dataset_size is not None else 256
+val_holdout = args.val_dataset_size if args.val_dataset_size is not None else 256
 Task = all_tasks[args.task](
     tokenizer,
     legacy_tokenizer,
     args.generation_length,
-    **_task_kwargs(args.task, dataset_size=train_ds, seed=args.seed),
+    **_task_kwargs(args.task, dataset_size=train_ds, seed=args.seed, val_holdout_size=val_holdout),
 )
 print(f"Train dataset size: {len(Task)}")
+if args.task == "countdown_chat":
+    from hyperscalees.environments.llm_bandits import countdown_train_val_overlap
+    overlap = countdown_train_val_overlap(train_ds, val_holdout, train_seed=args.seed)
+    print(f"Countdown train∩val overlap: {overlap} (disjoint split, seed={42})")
+if args.random_train_prompts:
+    if args.prompts_per_epoch > len(Task):
+        raise ValueError(
+            f"random_train_prompts needs prompts_per_epoch ({args.prompts_per_epoch}) "
+            f"<= train dataset size ({len(Task)})"
+        )
+    print(f"Random train prompt sampling: {args.prompts_per_epoch} unique examples per epoch")
 
 def replicate_matrix(x):
     if not USE_SHARD_MAP:
@@ -328,6 +343,15 @@ if args.track:
         dir=str(wandb_dir),
     )
 
+def _epoch_train_indices(epoch: int) -> np.ndarray:
+    """Dataset row indices for this epoch's unique train prompts."""
+    if args.random_train_prompts:
+        rng = np.random.default_rng(args.seed + epoch)
+        return rng.choice(len(Task), size=args.prompts_per_epoch, replace=False)
+    start = epoch * args.prompts_per_epoch
+    return np.arange(start, start + args.prompts_per_epoch, dtype=np.int32)
+
+
 def single_epoch(noiser_params, params, true_train_fitness_sum, epoch):
     if epoch % args.validate_every == 0:
         print("VALIDATION")
@@ -337,22 +361,21 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch):
         validation_score = None
     # print("CURRENT MEMORY start of epoch", jax.local_devices()[0].memory_stats())
     start_time = time.time()
+    train_indices = _epoch_train_indices(epoch)
+    if args.random_train_prompts and epoch % args.validate_every == 0:
+        print(f"Epoch {epoch} train indices: {train_indices.tolist()}")
     if USE_SHARD_MAP:
-        unique_indices = (
-            jax.device_put(replicate_matrix(jnp.arange(args.prompts_per_epoch)), NamedSharding(mesh, P("data")))
-            + epoch * args.prompts_per_epoch
+        unique_indices = jax.device_put(
+            replicate_matrix(jnp.asarray(train_indices, dtype=jnp.int32)),
+            NamedSharding(mesh, P("data")),
         )
         indices = jnp.repeat(unique_indices, args.generations_per_prompt, axis=0)
-
-        base_idx = epoch * args.prompts_per_epoch
-        unique_prompts_np = np.stack(
-            [np.asarray(Task.get_input(base_idx + i)) for i in range(args.prompts_per_epoch)]
-        )
+        unique_prompts_np = np.asarray(Task.get_input(jnp.asarray(train_indices, dtype=jnp.int32)))
         batch_prompts = shard_on_data(
             np.repeat(unique_prompts_np, args.generations_per_prompt, axis=0)
         )
     else:
-        unique_indices = jnp.arange(args.prompts_per_epoch, dtype=jnp.int32) + epoch * args.prompts_per_epoch
+        unique_indices = jnp.asarray(train_indices, dtype=jnp.int32)
         indices = jnp.repeat(unique_indices, args.generations_per_prompt, axis=0)
         unique_prompts = Task.get_input(unique_indices)
         batch_prompts = jnp.repeat(unique_prompts, args.generations_per_prompt, axis=0)

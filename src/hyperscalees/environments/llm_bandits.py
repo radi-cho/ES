@@ -555,14 +555,47 @@ class CountdownNValRG(ReasoningGymTrain):
 
 
 _COUNTDOWN_JSON_PATH = Path(__file__).resolve().parents[3] / "data" / "countdown.json"
+_COUNTDOWN_SPLIT_SEED = 42
 
 
-def _load_countdown_json_dataset(seed: int, dataset_size: int | None = None):
+def _countdown_example_key(example) -> tuple:
+    return (tuple(example["numbers"]), example["target"])
+
+
+def _countdown_shuffled_dataset():
     ds = load_dataset("json", data_files=str(_COUNTDOWN_JSON_PATH), split="train")
-    ds = ds.shuffle(seed=seed)
-    if dataset_size is not None:
-        ds = ds.select(range(min(dataset_size, len(ds))))
-    return ds
+    return ds.shuffle(seed=_COUNTDOWN_SPLIT_SEED)
+
+
+def _load_countdown_disjoint_val(val_size: int = 256):
+    ds = _countdown_shuffled_dataset()
+    n = min(val_size, len(ds))
+    return ds.select(range(n))
+
+
+def _load_countdown_disjoint_train(
+    seed: int,
+    train_size: int,
+    val_holdout_size: int = 256,
+):
+    ds = _countdown_shuffled_dataset()
+    if val_holdout_size >= len(ds):
+        raise ValueError(
+            f"val_holdout_size={val_holdout_size} must be smaller than dataset ({len(ds)})"
+        )
+    train_pool = ds.select(range(val_holdout_size, len(ds)))
+    train_pool = train_pool.shuffle(seed=seed)
+    n = min(train_size, len(train_pool))
+    return train_pool.select(range(n))
+
+
+def countdown_train_val_overlap(train_size: int, val_size: int, train_seed: int = 0) -> int:
+    """Return |train ∩ val| for the disjoint countdown split (expect 0)."""
+    train = _load_countdown_disjoint_train(train_seed, train_size, val_holdout_size=val_size)
+    val = _load_countdown_disjoint_val(val_size)
+    train_keys = {_countdown_example_key(x) for x in train}
+    val_keys = {_countdown_example_key(x) for x in val}
+    return len(train_keys & val_keys)
 
 
 _COUNTDOWN_CHAT_THINK_CLOSE = r"(?:<\/think>|<\/redacted_thinking>)"
@@ -628,9 +661,13 @@ class CountdownChatTrain(BanditTask):
     """Countdown with eggroll-vllm chat/XML prompt format (countdown.json)."""
 
     def __init__(self, encoding_tokenizer, decoding_tokenizer, max_num_steps,
-                 dataset_size=256, seed=0):
+                 dataset_size=256, seed=0, val_holdout_size=256):
         super().__init__(encoding_tokenizer, decoding_tokenizer, max_num_steps)
-        self.dataset = _load_countdown_json_dataset(seed=seed, dataset_size=dataset_size)
+        self.dataset = _load_countdown_disjoint_train(
+            seed=seed,
+            train_size=dataset_size,
+            val_holdout_size=val_holdout_size,
+        )
         self.dataset_size = len(self.dataset)
 
     def __len__(self):
@@ -663,9 +700,10 @@ class CountdownChatTrain(BanditTask):
 
 class CountdownChatVal(CountdownChatTrain):
     def __init__(self, encoding_tokenizer, decoding_tokenizer, max_num_steps,
-                 dataset_size=256, seed=12345):
-        super().__init__(encoding_tokenizer, decoding_tokenizer, max_num_steps,
-                         dataset_size=dataset_size, seed=seed)
+                 dataset_size=256, seed=12345, val_holdout_size=256):
+        BanditTask.__init__(self, encoding_tokenizer, decoding_tokenizer, max_num_steps)
+        self.dataset = _load_countdown_disjoint_val(dataset_size)
+        self.dataset_size = len(self.dataset)
 
 
 # ----------------------------
