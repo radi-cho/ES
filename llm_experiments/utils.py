@@ -109,7 +109,15 @@ def build_validate(MODEL, config, params_example, base_evo_keys, master_gen_key,
     frozen_noiser_params, noiser_params = NOISER.init_noiser(params_example, sigma, 0.0)
 
     if use_validation_set:
-        validation_task = validation_tasks[args.task](tokenizer, legacy_tokenizer, args.generation_length)
+        val_cls = validation_tasks[args.task]
+        if args.task == "countdown_chat":
+            val_ds = getattr(args, "val_dataset_size", None) or 256
+            validation_task = val_cls(
+                tokenizer, legacy_tokenizer, args.generation_length,
+                dataset_size=val_ds, seed=12345,
+            )
+        else:
+            validation_task = val_cls(tokenizer, legacy_tokenizer, args.generation_length)
     else:
         validation_task = all_tasks[args.task](tokenizer, legacy_tokenizer, args.generation_length)
 

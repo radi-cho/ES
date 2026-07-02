@@ -88,6 +88,10 @@ class Args:
 
     generations_per_prompt: int = 8
 
+    train_dataset_size: Optional[int] = None
+    val_dataset_size: Optional[int] = None
+    time_budget_seconds: Optional[float] = None
+
     coord_addr: Optional[str] = None
     num_procs: Optional[int] = None
     proc_id: Optional[int] = None
@@ -155,7 +159,24 @@ config, params, scan_map, es_map = full_params
 
 args.prompts_per_epoch = args.total_parallel_generations // args.generations_per_prompt
 
-Task = all_tasks[args.task](tokenizer, legacy_tokenizer, args.generation_length)
+def _task_kwargs(task_name: str, *, dataset_size: Optional[int], seed: Optional[int]) -> dict:
+    if task_name != "countdown_chat":
+        return {}
+    kwargs = {}
+    if dataset_size is not None:
+        kwargs["dataset_size"] = dataset_size
+    if seed is not None:
+        kwargs["seed"] = seed
+    return kwargs
+
+train_ds = args.train_dataset_size if args.train_dataset_size is not None else 256
+Task = all_tasks[args.task](
+    tokenizer,
+    legacy_tokenizer,
+    args.generation_length,
+    **_task_kwargs(args.task, dataset_size=train_ds, seed=args.seed),
+)
+print(f"Train dataset size: {len(Task)}")
 
 def replicate_matrix(x):
     if not USE_SHARD_MAP:
@@ -279,6 +300,8 @@ FULL = 0
 LORA = 1
 
 full_name = f"{args.task}_{args.noiser}_{args.wandb_name}_lr={args.lr_scale}_sigma={args.sigma:.2e}_bs={args.total_parallel_generations}"
+if args.train_dataset_size is not None:
+    full_name += f"_trainD={args.train_dataset_size}"
 experiment_id = f"{full_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 base_out_dir = Path(args.output_directory) if args.output_directory else (Path.cwd() / "outputs")
@@ -475,13 +498,39 @@ with open(validation_csv_path, "w", encoding="utf-8") as f:
 
 run_start_time = time.time()
 
+
+def _effective_time_budget_seconds() -> Optional[float]:
+    """Runtime budget override via env or a file in the run output directory."""
+    env_val = os.environ.get("HYPERSCALEES_TIME_BUDGET_SECONDS")
+    if env_val is not None:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass
+    override_path = run_out_dir / "time_budget_override.txt"
+    if override_path.exists():
+        try:
+            return float(override_path.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pass
+    return args.time_budget_seconds
+
+
 for epoch in tqdm.trange(args.num_epochs):
+    budget = _effective_time_budget_seconds()
+    if budget is not None and (time.time() - run_start_time) >= budget:
+        print(f"Time budget ({budget}s) reached before epoch {epoch}. Stopping.")
+        break
     noiser_params, params, true_train_fitness_sum = single_epoch(noiser_params, params, true_train_fitness_sum, epoch)
+    budget = _effective_time_budget_seconds()
+    if budget is not None and (time.time() - run_start_time) >= budget:
+        print(f"Time budget ({budget}s) reached after epoch {epoch}. Stopping.")
+        break
 
 if validation_csv_path.exists() and validation_csv_path.stat().st_size > len("epoch,validation_score,time_seconds\n"):
     from .plot_figure_4b import plot_figure_4b
 
-    plot_figure_4b(validation_csv_path, figure_4b_path)
+    plot_figure_4b(validation_csv_path, figure_4b_path, model=args.model_choice)
     print(f"Saved validation log: {validation_csv_path}")
     print(f"Saved figure: {figure_4b_path}")
     print(f"Saved figure: {figure_4b_path.with_suffix('.pdf')}")

@@ -16,6 +16,40 @@ _MODEL_LABELS = {
 }
 
 
+def plot_figure_4b_compare(
+    curves: list[tuple[Path, str]],
+    output_path: Path,
+    title: str | None = None,
+) -> Path:
+    if not curves:
+        raise ValueError("At least one validation.csv is required")
+
+    plt.figure(figsize=(6.2, 4.2))
+    for validation_csv, label in curves:
+        df = pd.read_csv(validation_csv)
+        required = {"epoch", "validation_score", "time_seconds"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"{validation_csv} missing columns: {sorted(missing)}")
+        x_hours = df["time_seconds"] / 3600.0
+        plt.plot(x_hours, df["validation_score"], linewidth=2, label=label)
+
+    if title is None:
+        title = "Countdown validation — data efficiency (EGGROLL)"
+
+    plt.xlabel("Wall-clock time (hours)")
+    plt.ylabel("Validation score")
+    plt.title(title)
+    plt.ylim(bottom=0.0)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.savefig(output_path.with_suffix(".pdf"))
+    plt.close()
+    return output_path
+
+
 def plot_figure_4b(
     validation_csv: Path,
     output_path: Path | None = None,
@@ -63,9 +97,14 @@ def main() -> None:
     parser.add_argument(
         "validation_csv",
         type=Path,
-        nargs="?",
-        default=Path("validation.csv"),
-        help="Path to validation.csv (default: ./validation.csv)",
+        nargs="+",
+        help="One or more validation.csv paths (multiple → combined plot)",
+    )
+    parser.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        help="Legend label per CSV (same order; default: trainD from path or filename)",
     )
     parser.add_argument(
         "-o",
@@ -88,7 +127,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    out = plot_figure_4b(args.validation_csv, args.output, title=args.title, model=args.model)
+    if len(args.validation_csv) == 1:
+        out = plot_figure_4b(
+            args.validation_csv[0], args.output, title=args.title, model=args.model
+        )
+    else:
+        labels = args.label or []
+        if len(labels) not in (0, len(args.validation_csv)):
+            parser.error("Provide zero or one --label per validation_csv")
+        if not labels:
+            labels = []
+            for csv_path in args.validation_csv:
+                name = csv_path.as_posix()
+                if "trainD=10" in name:
+                    labels.append("train D=10")
+                elif "trainD=256" in name:
+                    labels.append("train D=256")
+                else:
+                    labels.append(csv_path.parent.name)
+        curves = list(zip(args.validation_csv, labels))
+        out = args.output or Path("figure_data_efficiency.png")
+        out = plot_figure_4b_compare(curves, out, title=args.title)
     print(f"Saved: {out}")
     print(f"Saved: {out.with_suffix('.pdf')}")
 
