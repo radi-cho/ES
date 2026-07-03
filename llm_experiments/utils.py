@@ -9,6 +9,7 @@ import tqdm
 import time
 
 import numpy as np
+from datasets import load_dataset
 
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.experimental.multihost_utils import process_allgather
@@ -144,4 +145,133 @@ def build_validate(MODEL, config, params_example, base_evo_keys, master_gen_key,
         
         return sum_scores / (args.parallel_validations * args.validation_iterations)
     
+    return validate
+
+
+HELLASWAG_SEQ_LEN = 128
+
+
+def _pad_token_ids(ids, max_len: int):
+    ids = list(ids)[:max_len]
+    n = len(ids)
+    arr = np.zeros(max_len, dtype=np.int32)
+    if n:
+        arr[:n] = np.asarray(ids, dtype=np.int32)
+    return arr, n
+
+
+def _prepare_hellaswag_examples(tokenizer, val_size: int, seed: int = 42):
+    """Load HellaSwag validation split (disjoint from countdown train data)."""
+    ds = load_dataset("Rowan/hellaswag", split="validation")
+    ds = ds.shuffle(seed=seed).select(range(min(val_size, len(ds))))
+    examples = []
+    for ex in ds:
+        ctx_ids = list(tokenizer.encode(ex["ctx"]))
+        max_ctx = max(1, HELLASWAG_SEQ_LEN // 2)
+        ctx_ids = ctx_ids[:max_ctx]
+        ctx_len = len(ctx_ids)
+        tokens = []
+        ending_lens = []
+        for ending in ex["endings"]:
+            ending_ids = list(tokenizer.encode(ending))
+            max_ending = max(1, HELLASWAG_SEQ_LEN - ctx_len)
+            ending_ids = ending_ids[:max_ending]
+            combined = ctx_ids + ending_ids
+            padded, _ = _pad_token_ids(combined, HELLASWAG_SEQ_LEN)
+            tokens.append(padded)
+            ending_lens.append(len(ending_ids))
+        examples.append(
+            {
+                "tokens": np.stack(tokens, axis=0),
+                "ctx_len": ctx_len,
+                "ending_lens": np.asarray(ending_lens, dtype=np.int32),
+                "label": int(ex["label"]),
+            }
+        )
+    return examples
+
+
+def build_hellaswag_validate(
+    MODEL,
+    config,
+    params_example,
+    base_evo_keys,
+    master_gen_key,
+    tokenizer,
+    NOISER=hs.noiser.base_noiser.Noiser,
+    val_size: int = 256,
+    seed: int = 42,
+    suppress_eos_token=None,
+):
+    """Multiple-choice HellaSwag accuracy via length-normalized teacher-forced log-likelihood."""
+    frozen_noiser_params, noiser_params = NOISER.init_noiser(params_example, 0.0, 0.0)
+    examples = _prepare_hellaswag_examples(tokenizer, val_size, seed=seed)
+    print(f"HellaSwag validation examples: {len(examples)} (HF validation split, seed={seed})")
+
+    def forward_logit(noiser_params, params, input_token, state, gen_key, iterinfo):
+        generated_outs, generated_state = MODEL.forward(
+            NOISER,
+            frozen_noiser_params,
+            noiser_params,
+            config,
+            params,
+            base_evo_keys,
+            iterinfo,
+            input_token,
+            state,
+        )
+        logits = generated_outs[-1]
+        if suppress_eos_token is not None:
+            logits = logits.at[suppress_eos_token].set(-jnp.inf)
+        return logits, generated_state, gen_key
+
+    def score_endings(noiser_params, params, tokens, ctx_len, ending_lens, epoch_num, thread_idx):
+        init_state = MODEL.default_state(params, config)
+        start_gen_key = fold_in_helper(master_gen_key, epoch_num, thread_idx)
+        iterinfo = (epoch_num, thread_idx)
+
+        def step(carry, target_pos):
+            tok, state, gen_key = carry
+            target = tokens[target_pos]
+            logits, state, gen_key = forward_logit(
+                noiser_params, params, tok, state, gen_key, iterinfo
+            )
+            log_probs = jax.nn.log_softmax(logits)
+            logp = log_probs[target]
+            in_suffix = jnp.logical_and(
+                target_pos >= ctx_len,
+                target_pos < ctx_len + ending_lens,
+            )
+            return (target, state, gen_key), jnp.where(in_suffix, logp, 0.0)
+
+        init_carry = (tokens[0], init_state, start_gen_key)
+        positions = jnp.arange(1, HELLASWAG_SEQ_LEN, dtype=jnp.int32)
+        _, logps = jax.lax.scan(step, init_carry, positions)
+        denom = jnp.maximum(ending_lens, 1)
+        return jnp.sum(logps) / denom
+
+    score_batch_fn = jax.jit(
+        jax.vmap(
+            score_endings,
+            in_axes=(None, None, 0, None, 0, None, None),
+        )
+    )
+
+    def validate(params, epoch):
+        correct = 0
+        for ex_idx, ex in enumerate(tqdm.tqdm(examples, desc="HellaSwag")):
+            scores = score_batch_fn(
+                noiser_params,
+                params,
+                jnp.asarray(ex["tokens"]),
+                jnp.int32(ex["ctx_len"]),
+                jnp.asarray(ex["ending_lens"]),
+                epoch,
+                ex_idx,
+            )
+            pred = int(np.argmax(np.asarray(scores)))
+            if pred == ex["label"]:
+                correct += 1
+        return correct / len(examples)
+
     return validate

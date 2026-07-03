@@ -37,7 +37,8 @@ from hydra.utils import instantiate
 
 from .utils import (
     build_generate_thread, 
-    build_validate, 
+    build_validate,
+    build_hellaswag_validate,
     safe_decode
 )
 
@@ -92,6 +93,9 @@ class Args:
     val_dataset_size: Optional[int] = None
     time_budget_seconds: Optional[float] = None
     random_train_prompts: bool = False
+    aux_validation_task: Optional[Literal["hellaswag"]] = None
+    hellaswag_val_size: int = 256
+    hellaswag_val_seed: int = 42
 
     coord_addr: Optional[str] = None
     num_procs: Optional[int] = None
@@ -274,6 +278,22 @@ print(generate_batch.memory_analysis())
 
 validate = build_validate(RWKV, config, params, base_evo_keys, base_valid_key, tokenizer, legacy_tokenizer, args, args.temperature, suppress_eos_token=suppress_eos_token)
 
+hellaswag_validate = None
+hellaswag_csv_path = None
+if args.aux_validation_task == "hellaswag":
+    hellaswag_validate = build_hellaswag_validate(
+        RWKV,
+        config,
+        params,
+        base_evo_keys,
+        base_valid_key,
+        tokenizer,
+        NOISER=NOISER,
+        val_size=args.hellaswag_val_size,
+        seed=args.hellaswag_val_seed,
+        suppress_eos_token=suppress_eos_token,
+    )
+
 def _do_update(noiser_params, params, raw_scores, epoch_num):
     iterinfos = (jnp.full_like(raw_scores, epoch_num, dtype=jnp.int32), global_indices)
 
@@ -325,6 +345,7 @@ run_out_dir.mkdir(parents=True, exist_ok=True)
 
 fitness_csv_path = run_out_dir / "fitness.csv"
 validation_csv_path = run_out_dir / "validation.csv"
+hellaswag_csv_path = run_out_dir / "hellaswag_validation.csv"
 figure_4b_path = run_out_dir / "figure_4b.png"
 
 print("Run name", full_name)
@@ -353,12 +374,16 @@ def _epoch_train_indices(epoch: int) -> np.ndarray:
 
 
 def single_epoch(noiser_params, params, true_train_fitness_sum, epoch):
+    validation_score = None
+    hellaswag_score = None
     if epoch % args.validate_every == 0:
         print("VALIDATION")
         validation_score = validate(params, epoch)
         print("VALIDATION SCORE=", validation_score)
-    else:
-        validation_score = None
+        if hellaswag_validate is not None:
+            print("HELLASWAG VALIDATION")
+            hellaswag_score = hellaswag_validate(params, epoch)
+            print("HELLASWAG SCORE=", hellaswag_score)
     # print("CURRENT MEMORY start of epoch", jax.local_devices()[0].memory_stats())
     start_time = time.time()
     train_indices = _epoch_train_indices(epoch)
@@ -499,6 +524,11 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch):
         elapsed = time.time() - run_start_time
         with open(validation_csv_path, "a", encoding="utf-8") as f:
             f.write(f"{epoch},{float(validation_score)},{elapsed:.3f}\n")
+    if hellaswag_score is not None:
+        stats["hellaswag_validation_score"] = hellaswag_score
+        elapsed = time.time() - run_start_time
+        with open(hellaswag_csv_path, "a", encoding="utf-8") as f:
+            f.write(f"{epoch},{float(hellaswag_score)},{elapsed:.3f}\n")
 
     with open(fitness_csv_path, "a", encoding="utf-8") as f:
         f.write(f"{epoch},{float(jnp.mean(output_scores))}\n")
@@ -518,6 +548,9 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch):
 
 with open(validation_csv_path, "w", encoding="utf-8") as f:
     f.write("epoch,validation_score,time_seconds\n")
+if hellaswag_validate is not None:
+    with open(hellaswag_csv_path, "w", encoding="utf-8") as f:
+        f.write("epoch,validation_score,time_seconds\n")
 
 run_start_time = time.time()
 
