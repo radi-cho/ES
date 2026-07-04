@@ -1,6 +1,7 @@
 import os
 import sys
 import csv
+import json
 import jax
 from huggingface_hub.constants import HF_HOME
 
@@ -93,6 +94,9 @@ class Args:
     val_dataset_size: Optional[int] = None
     time_budget_seconds: Optional[float] = None
     random_train_prompts: bool = False
+    train_phased_subset_sizes: Optional[str] = None
+    train_phased_durations_seconds: Optional[str] = None
+    train_phased_split_seed: Optional[int] = None
     aux_validation_task: Optional[Literal["hellaswag"]] = None
     hellaswag_val_size: int = 256
     hellaswag_val_seed: int = 42
@@ -196,6 +200,81 @@ if args.random_train_prompts:
             f"<= train dataset size ({len(Task)})"
         )
     print(f"Random train prompt sampling: {args.prompts_per_epoch} unique examples per epoch")
+
+_train_phased_subsets: Optional[list[np.ndarray]] = None
+_train_phased_durations: Optional[list[float]] = None
+_train_phased_active_idx: int = -1
+
+
+def _init_train_phased_subsets(run_dir: Path) -> None:
+    global _train_phased_subsets, _train_phased_durations, _train_phased_active_idx
+    if args.train_phased_subset_sizes is None:
+        _train_phased_subsets = None
+        _train_phased_durations = None
+        return
+
+    sizes = [int(x.strip()) for x in args.train_phased_subset_sizes.split(",") if x.strip()]
+    if not sizes:
+        raise ValueError("train_phased_subset_sizes must list at least one subset size")
+    if sum(sizes) != len(Task):
+        raise ValueError(
+            f"train_phased_subset_sizes ({sizes}) must sum to train dataset size ({len(Task)})"
+        )
+    if args.train_phased_durations_seconds is None:
+        raise ValueError("train_phased_durations_seconds is required with train_phased_subset_sizes")
+    durations = [
+        float(x.strip())
+        for x in args.train_phased_durations_seconds.split(",")
+        if x.strip()
+    ]
+    if len(durations) != len(sizes):
+        raise ValueError(
+            f"train_phased_durations_seconds ({durations}) must match "
+            f"train_phased_subset_sizes ({sizes})"
+        )
+
+    split_seed = args.train_phased_split_seed if args.train_phased_split_seed is not None else args.seed
+    rng = np.random.default_rng(split_seed)
+    perm = rng.permutation(len(Task)).astype(np.int32)
+    subsets: list[np.ndarray] = []
+    offset = 0
+    for size in sizes:
+        subsets.append(perm[offset : offset + size])
+        offset += size
+
+    _train_phased_subsets = subsets
+    _train_phased_durations = durations
+    _train_phased_active_idx = -1
+
+    print(
+        f"Phased train pools: {len(subsets)} phases, durations={durations}s, split_seed={split_seed}"
+    )
+    for phase_idx, (subset, duration) in enumerate(zip(subsets, durations)):
+        print(
+            f"  Phase {phase_idx + 1}: {len(subset)} examples for {duration}s, "
+            f"indices={subset.tolist()}"
+        )
+
+    phase_meta = {
+        "split_seed": split_seed,
+        "subset_sizes": sizes,
+        "durations_seconds": durations,
+        "subsets": [subset.tolist() for subset in subsets],
+    }
+    phase_path = run_dir / "train_phased_subsets.json"
+    phase_path.write_text(json.dumps(phase_meta, indent=2), encoding="utf-8")
+    print(f"Saved phased train split: {phase_path}")
+
+
+def _active_phased_pool(elapsed_seconds: float) -> tuple[int, np.ndarray]:
+    assert _train_phased_subsets is not None and _train_phased_durations is not None
+    cumulative = 0.0
+    for phase_idx, duration in enumerate(_train_phased_durations):
+        cumulative += duration
+        if elapsed_seconds < cumulative:
+            return phase_idx, _train_phased_subsets[phase_idx]
+    return len(_train_phased_subsets) - 1, _train_phased_subsets[-1]
+
 
 def replicate_matrix(x):
     if not USE_SHARD_MAP:
@@ -364,8 +443,34 @@ if args.track:
         dir=str(wandb_dir),
     )
 
-def _epoch_train_indices(epoch: int) -> np.ndarray:
+_init_train_phased_subsets(run_out_dir)
+if args.train_phased_subset_sizes is not None and not args.random_train_prompts:
+    raise ValueError("train_phased_subset_sizes requires --random-train-prompts")
+
+
+def _epoch_train_indices(epoch: int, elapsed_seconds: float) -> np.ndarray:
     """Dataset row indices for this epoch's unique train prompts."""
+    global _train_phased_active_idx
+
+    if _train_phased_subsets is not None:
+        phase_idx, pool = _active_phased_pool(elapsed_seconds)
+        if phase_idx != _train_phased_active_idx:
+            _train_phased_active_idx = phase_idx
+            print(
+                f"Train phase {phase_idx + 1}/{len(_train_phased_subsets)} active: "
+                f"{len(pool)} examples, indices={pool.tolist()}"
+            )
+        if args.random_train_prompts:
+            if args.prompts_per_epoch > len(pool):
+                raise ValueError(
+                    f"random_train_prompts needs prompts_per_epoch ({args.prompts_per_epoch}) "
+                    f"<= active phased pool size ({len(pool)})"
+                )
+            rng = np.random.default_rng(args.seed + epoch)
+            return rng.choice(pool, size=args.prompts_per_epoch, replace=False)
+        start = epoch * args.prompts_per_epoch
+        return pool[start : start + args.prompts_per_epoch]
+
     if args.random_train_prompts:
         rng = np.random.default_rng(args.seed + epoch)
         return rng.choice(len(Task), size=args.prompts_per_epoch, replace=False)
@@ -373,7 +478,7 @@ def _epoch_train_indices(epoch: int) -> np.ndarray:
     return np.arange(start, start + args.prompts_per_epoch, dtype=np.int32)
 
 
-def single_epoch(noiser_params, params, true_train_fitness_sum, epoch):
+def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_seconds: float):
     validation_score = None
     hellaswag_score = None
     if epoch % args.validate_every == 0:
@@ -386,7 +491,7 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch):
             print("HELLASWAG SCORE=", hellaswag_score)
     # print("CURRENT MEMORY start of epoch", jax.local_devices()[0].memory_stats())
     start_time = time.time()
-    train_indices = _epoch_train_indices(epoch)
+    train_indices = _epoch_train_indices(epoch, elapsed_seconds)
     if args.random_train_prompts and epoch % args.validate_every == 0:
         print(f"Epoch {epoch} train indices: {train_indices.tolist()}")
     if USE_SHARD_MAP:
@@ -577,7 +682,9 @@ for epoch in tqdm.trange(args.num_epochs):
     if budget is not None and (time.time() - run_start_time) >= budget:
         print(f"Time budget ({budget}s) reached before epoch {epoch}. Stopping.")
         break
-    noiser_params, params, true_train_fitness_sum = single_epoch(noiser_params, params, true_train_fitness_sum, epoch)
+    noiser_params, params, true_train_fitness_sum = single_epoch(
+        noiser_params, params, true_train_fitness_sum, epoch, time.time() - run_start_time
+    )
     budget = _effective_time_budget_seconds()
     if budget is not None and (time.time() - run_start_time) >= budget:
         print(f"Time budget ({budget}s) reached after epoch {epoch}. Stopping.")

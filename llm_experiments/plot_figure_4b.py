@@ -20,6 +20,7 @@ def plot_figure_4b_compare(
     curves: list[tuple[Path, str]],
     output_path: Path,
     title: str | None = None,
+    max_hours: float | None = None,
 ) -> Path:
     if not curves:
         raise ValueError("At least one validation.csv is required")
@@ -31,8 +32,14 @@ def plot_figure_4b_compare(
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"{validation_csv} missing columns: {sorted(missing)}")
+        if max_hours is not None:
+            df = df[df["time_seconds"] <= max_hours * 3600.0]
+            if df.empty:
+                raise ValueError(f"{validation_csv} has no points within {max_hours}h")
         x_hours = df["time_seconds"] / 3600.0
         plt.plot(x_hours, df["validation_score"], linewidth=2, label=label)
+    if max_hours is not None:
+        plt.xlim(left=0.0, right=max_hours)
 
     if title is None:
         title = "Countdown validation — data efficiency (EGGROLL)"
@@ -125,6 +132,12 @@ def main() -> None:
         default=None,
         help="Custom plot title",
     )
+    parser.add_argument(
+        "--max-hours",
+        type=float,
+        default=None,
+        help="Truncate all curves to this wall-clock horizon (hours)",
+    )
     args = parser.parse_args()
 
     if len(args.validation_csv) == 1:
@@ -147,7 +160,7 @@ def main() -> None:
                     labels.append(csv_path.parent.name)
         curves = list(zip(args.validation_csv, labels))
         out = args.output or Path("figure_data_efficiency.png")
-        out = plot_figure_4b_compare(curves, out, title=args.title)
+        out = plot_figure_4b_compare(curves, out, title=args.title, max_hours=args.max_hours)
     print(f"Saved: {out}")
     print(f"Saved: {out.with_suffix('.pdf')}")
 
