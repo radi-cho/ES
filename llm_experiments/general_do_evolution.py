@@ -39,6 +39,7 @@ from hydra.utils import instantiate
 from .utils import (
     build_generate_thread, 
     build_validate,
+    build_train_eval,
     build_hellaswag_validate,
     safe_decode
 )
@@ -77,6 +78,7 @@ class Args:
     temperature: float = 0.0
 
     validate_every: int = 10
+    eval_train_every: Optional[int] = None
     parallel_validations: int = 128
     validation_iterations: int = 10
 
@@ -357,6 +359,21 @@ print(generate_batch.memory_analysis())
 
 validate = build_validate(RWKV, config, params, base_evo_keys, base_valid_key, tokenizer, legacy_tokenizer, args, args.temperature, suppress_eos_token=suppress_eos_token)
 
+train_eval = None
+if args.eval_train_every is not None and args.eval_train_every > 0:
+    train_eval = build_train_eval(
+        RWKV,
+        config,
+        params,
+        base_evo_keys,
+        base_gen_key,
+        Task,
+        args,
+        NOISER=NOISER,
+        temperature=args.temperature,
+        suppress_eos_token=suppress_eos_token,
+    )
+
 hellaswag_validate = None
 hellaswag_csv_path = None
 if args.aux_validation_task == "hellaswag":
@@ -424,6 +441,7 @@ run_out_dir.mkdir(parents=True, exist_ok=True)
 
 fitness_csv_path = run_out_dir / "fitness.csv"
 validation_csv_path = run_out_dir / "validation.csv"
+metrics_csv_path = run_out_dir / "metrics.csv"
 hellaswag_csv_path = run_out_dir / "hellaswag_validation.csv"
 figure_4b_path = run_out_dir / "figure_4b.png"
 
@@ -478,13 +496,45 @@ def _epoch_train_indices(epoch: int, elapsed_seconds: float) -> np.ndarray:
     return np.arange(start, start + args.prompts_per_epoch, dtype=np.int32)
 
 
+def _current_train_phase(elapsed_seconds: float) -> int:
+    if _train_phased_subsets is None:
+        return -1
+    phase_idx, _ = _active_phased_pool(elapsed_seconds)
+    return phase_idx
+
+
+def _active_train_pool_indices(elapsed_seconds: float) -> np.ndarray:
+    if _train_phased_subsets is None:
+        return np.arange(len(Task), dtype=np.int32)
+    _, pool = _active_phased_pool(elapsed_seconds)
+    return pool
+
+
+def _mean_tree_rms(tree) -> float:
+    leaves = jax.tree.leaves(tree)
+    if not leaves:
+        return 0.0
+    return float(jnp.mean(jnp.array([jnp.mean(x) for x in leaves])))
+
+
 def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_seconds: float):
     validation_score = None
+    train_eval_score = None
+    active_pool_train_eval_score = None
     hellaswag_score = None
     if epoch % args.validate_every == 0:
         print("VALIDATION")
         validation_score = validate(params, epoch)
         print("VALIDATION SCORE=", validation_score)
+    if train_eval is not None and epoch % args.eval_train_every == 0:
+        active_pool = _active_train_pool_indices(elapsed_seconds)
+        print("TRAIN EVAL (all 30)")
+        train_eval_score = train_eval(params, epoch)
+        print("TRAIN EVAL SCORE=", train_eval_score)
+        print(f"TRAIN EVAL (active pool, n={len(active_pool)})")
+        active_pool_train_eval_score = train_eval(params, epoch, active_pool)
+        print("ACTIVE POOL TRAIN EVAL SCORE=", active_pool_train_eval_score)
+    if epoch % args.validate_every == 0:
         if hellaswag_validate is not None:
             print("HELLASWAG VALIDATION")
             hellaswag_score = hellaswag_validate(params, epoch)
@@ -601,6 +651,7 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
     # parameter_differences = jax.tree.map(lambda x, y:jnp.mean(jnp.abs(x-y)), params, updated_params)
     lora_updates = jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == LORA else 0.0, parameter_differences, es_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == LORA else 0.0, es_map))
     nonlora_updates = jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == FULL else 0.0, parameter_differences, es_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == FULL else 0.0, es_map))
+    total_update_rms = _mean_tree_rms(parameter_differences)
 
     # params = updated_params
 
@@ -614,6 +665,8 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         "median_fitness": jnp.median(output_scores),
         "lora_updates": lora_updates,
         "nonlora_updates": nonlora_updates,
+        "total_update_rms": total_update_rms,
+        "train_phase": _current_train_phase(elapsed_seconds),
         # "total_lora_updates": total_lora_updates,
         # "total_nonlora_updates": total_nonlora_updates,
         "prompt_preproc_time": prompt_processing_time,
@@ -629,6 +682,24 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         elapsed = time.time() - run_start_time
         with open(validation_csv_path, "a", encoding="utf-8") as f:
             f.write(f"{epoch},{float(validation_score)},{elapsed:.3f}\n")
+    if train_eval_score is not None:
+        stats["train_eval_score"] = train_eval_score
+    if active_pool_train_eval_score is not None:
+        stats["active_pool_train_eval_score"] = active_pool_train_eval_score
+    if args.eval_train_every is not None and args.eval_train_every > 0:
+        elapsed = time.time() - run_start_time
+        phase = _current_train_phase(elapsed_seconds)
+        val_field = "" if validation_score is None else f"{float(validation_score):.9g}"
+        train_field = "" if train_eval_score is None else f"{float(train_eval_score):.9g}"
+        active_field = (
+            "" if active_pool_train_eval_score is None else f"{float(active_pool_train_eval_score):.9g}"
+        )
+        with open(metrics_csv_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{epoch},{elapsed:.3f},{phase},{val_field},{train_field},{active_field},"
+                f"{float(jnp.mean(output_scores)):.9g},"
+                f"{float(lora_updates):.9g},{float(nonlora_updates):.9g},{total_update_rms:.9g}\n"
+            )
     if hellaswag_score is not None:
         stats["hellaswag_validation_score"] = hellaswag_score
         elapsed = time.time() - run_start_time
@@ -653,6 +724,12 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
 
 with open(validation_csv_path, "w", encoding="utf-8") as f:
     f.write("epoch,validation_score,time_seconds\n")
+if args.eval_train_every is not None and args.eval_train_every > 0:
+    with open(metrics_csv_path, "w", encoding="utf-8") as f:
+        f.write(
+            "epoch,time_seconds,train_phase,validation_score,train_eval_score,"
+            "active_pool_train_eval_score,batch_fitness,lora_update_rms,nonlora_update_rms,total_update_rms\n"
+        )
 if hellaswag_validate is not None:
     with open(hellaswag_csv_path, "w", encoding="utf-8") as f:
         f.write("epoch,validation_score,time_seconds\n")

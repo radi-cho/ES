@@ -148,6 +148,83 @@ def build_validate(MODEL, config, params_example, base_evo_keys, master_gen_key,
     return validate
 
 
+def build_train_eval(
+    MODEL,
+    config,
+    params_example,
+    base_evo_keys,
+    master_gen_key,
+    train_task,
+    args,
+    NOISER=hs.noiser.base_noiser.Noiser,
+    sigma=0.0,
+    temperature=0.0,
+    suppress_eos_token=0,
+):
+    """Greedy fitness eval on all examples in the train task (in-distribution)."""
+    frozen_noiser_params, noiser_params = NOISER.init_noiser(params_example, sigma, 0.0)
+    _generate_thread = build_generate_thread(
+        MODEL,
+        NOISER,
+        frozen_noiser_params,
+        config,
+        base_evo_keys,
+        master_gen_key,
+        temperature,
+        suppress_eos_token=suppress_eos_token,
+    )
+
+    num_train = len(train_task)
+    compile_batch_size = num_train
+
+    print(f"Compiling train eval batch ({num_train} examples, compile_batch={compile_batch_size})")
+    start_time = time.time()
+    generate_batch = jax.jit(
+        jax.vmap(_generate_thread, in_axes=(None, None, 0, 0, None))
+    ).lower(
+        noiser_params,
+        params_example,
+        jax.ShapeDtypeStruct((compile_batch_size, args.generation_length), jnp.dtype("int32")),
+        jnp.arange(compile_batch_size),
+        0,
+    ).compile()
+    print("Compile time", time.time() - start_time)
+    print("memory info")
+    print(generate_batch.memory_analysis())
+
+    def evaluate_train(params, epoch, indices=None):
+        eval_indices = (
+            np.arange(num_train, dtype=np.int32)
+            if indices is None
+            else np.asarray(indices, dtype=np.int32)
+        )
+        sum_scores = 0.0
+        count = 0
+        for start in range(0, len(eval_indices), compile_batch_size):
+            chunk = eval_indices[start : start + compile_batch_size]
+            n = len(chunk)
+            if n < compile_batch_size:
+                chunk = np.pad(chunk, (0, compile_batch_size - n), mode="edge")
+            unique_indices = jnp.asarray(chunk, dtype=jnp.int32)
+            unique_prompts = train_task.get_input(unique_indices)
+            thread_idxes = jnp.arange(compile_batch_size, dtype=jnp.int32)
+            output_batch = jax.block_until_ready(
+                generate_batch(noiser_params, params, unique_prompts, thread_idxes, epoch)
+            )
+            fitnesses = jax.device_put(
+                train_task.get_batch_fitness(
+                    jax.device_put(unique_indices, jax.local_devices(backend="cpu")[0]),
+                    jax.device_put(output_batch, jax.local_devices(backend="cpu")[0]),
+                ),
+                output_batch.device,
+            )
+            sum_scores += float(jnp.sum(fitnesses[:n]))
+            count += n
+        return sum_scores / count
+
+    return evaluate_train
+
+
 HELLASWAG_SEQ_LEN = 128
 
 
