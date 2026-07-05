@@ -99,6 +99,11 @@ class Args:
     train_phased_subset_sizes: Optional[str] = None
     train_phased_durations_seconds: Optional[str] = None
     train_phased_split_seed: Optional[int] = None
+    train_phased_adaptive: bool = False
+    train_phased_adaptive_pool_threshold: float = 0.90
+    train_phased_adaptive_val_drop: float = 0.03
+    train_phased_adaptive_early_stop_val_drop: float = 0.03
+    train_phased_adaptive_min_seconds: float = 600.0
     aux_validation_task: Optional[Literal["hellaswag"]] = None
     hellaswag_val_size: int = 256
     hellaswag_val_seed: int = 42
@@ -206,6 +211,12 @@ if args.random_train_prompts:
 _train_phased_subsets: Optional[list[np.ndarray]] = None
 _train_phased_durations: Optional[list[float]] = None
 _train_phased_active_idx: int = -1
+_train_phased_adaptive_idx: int = 0
+_train_phased_phase_start_seconds: float = 0.0
+_train_phased_phase_peak_val: float = float("-inf")
+_train_phased_global_best_val: float = float("-inf")
+_train_phased_val_eval_history: list[float] = []
+_adaptive_stop_training: bool = False
 
 
 def _init_train_phased_subsets(run_dir: Path) -> None:
@@ -248,12 +259,22 @@ def _init_train_phased_subsets(run_dir: Path) -> None:
     _train_phased_durations = durations
     _train_phased_active_idx = -1
 
+    mode = "adaptive" if args.train_phased_adaptive else "fixed wall-clock"
     print(
-        f"Phased train pools: {len(subsets)} phases, durations={durations}s, split_seed={split_seed}"
+        f"Phased train pools ({mode}): {len(subsets)} phases, "
+        f"durations={durations}s, split_seed={split_seed}"
     )
-    for phase_idx, (subset, duration) in enumerate(zip(subsets, durations)):
+    if args.train_phased_adaptive:
         print(
-            f"  Phase {phase_idx + 1}: {len(subset)} examples for {duration}s, "
+            f"  Adaptive switch: pool>={args.train_phased_adaptive_pool_threshold}, "
+            f"val drop>={args.train_phased_adaptive_val_drop}, "
+            f"min_phase={args.train_phased_adaptive_min_seconds}s, "
+            f"early_stop_val_drop={args.train_phased_adaptive_early_stop_val_drop}"
+        )
+    for phase_idx, (subset, duration) in enumerate(zip(subsets, durations)):
+        cap = f"max {duration}s" if args.train_phased_adaptive else f"{duration}s"
+        print(
+            f"  Phase {phase_idx + 1}: {len(subset)} examples for {cap}, "
             f"indices={subset.tolist()}"
         )
 
@@ -261,6 +282,11 @@ def _init_train_phased_subsets(run_dir: Path) -> None:
         "split_seed": split_seed,
         "subset_sizes": sizes,
         "durations_seconds": durations,
+        "adaptive": args.train_phased_adaptive,
+        "adaptive_pool_threshold": args.train_phased_adaptive_pool_threshold,
+        "adaptive_val_drop": args.train_phased_adaptive_val_drop,
+        "adaptive_early_stop_val_drop": args.train_phased_adaptive_early_stop_val_drop,
+        "adaptive_min_seconds": args.train_phased_adaptive_min_seconds,
         "subsets": [subset.tolist() for subset in subsets],
     }
     phase_path = run_dir / "train_phased_subsets.json"
@@ -268,8 +294,91 @@ def _init_train_phased_subsets(run_dir: Path) -> None:
     print(f"Saved phased train split: {phase_path}")
 
 
+def _advance_phased_pool(elapsed_seconds: float, reason: str) -> None:
+    global _train_phased_adaptive_idx, _train_phased_phase_start_seconds
+    global _train_phased_phase_peak_val, _train_phased_val_eval_history
+    assert _train_phased_subsets is not None
+    if _train_phased_adaptive_idx >= len(_train_phased_subsets) - 1:
+        return
+    _train_phased_adaptive_idx += 1
+    _train_phased_phase_start_seconds = elapsed_seconds
+    _train_phased_phase_peak_val = float("-inf")
+    _train_phased_val_eval_history = []
+    pool = _train_phased_subsets[_train_phased_adaptive_idx]
+    print(
+        f"Adaptive phase switch ({reason}) -> "
+        f"phase {_train_phased_adaptive_idx + 1}/{len(_train_phased_subsets)}: "
+        f"{len(pool)} examples, indices={pool.tolist()}"
+    )
+
+
+def _maybe_force_adaptive_phase_cap(elapsed_seconds: float) -> None:
+    """Force-advance when the current phase exceeds its max duration cap."""
+    assert _train_phased_subsets is not None and _train_phased_durations is not None
+    while _train_phased_adaptive_idx < len(_train_phased_subsets) - 1:
+        phase_elapsed = elapsed_seconds - _train_phased_phase_start_seconds
+        if phase_elapsed < _train_phased_durations[_train_phased_adaptive_idx]:
+            break
+        _advance_phased_pool(elapsed_seconds, reason="max_phase_duration")
+
+
+def _check_adaptive_phased_switch(
+    elapsed_seconds: float,
+    validation_score: Optional[float],
+    active_pool_score: Optional[float],
+) -> None:
+    global _train_phased_global_best_val, _train_phased_phase_peak_val
+    global _train_phased_val_eval_history, _adaptive_stop_training
+    if not args.train_phased_adaptive or validation_score is None or active_pool_score is None:
+        return
+
+    val = float(validation_score)
+    pool_score = float(active_pool_score)
+    _train_phased_global_best_val = max(_train_phased_global_best_val, val)
+    _train_phased_phase_peak_val = max(_train_phased_phase_peak_val, val)
+    _train_phased_val_eval_history.append(val)
+
+    if (
+        len(_train_phased_val_eval_history) >= 2
+        and _train_phased_global_best_val > 0.0
+        and all(
+            v <= _train_phased_global_best_val - args.train_phased_adaptive_early_stop_val_drop
+            for v in _train_phased_val_eval_history[-2:]
+        )
+    ):
+        _adaptive_stop_training = True
+        print(
+            "Adaptive early stop: validation at or below "
+            f"{_train_phased_global_best_val - args.train_phased_adaptive_early_stop_val_drop:.4f} "
+            "for 2 consecutive evals"
+        )
+        return
+
+    if _train_phased_adaptive_idx >= len(_train_phased_subsets) - 1:
+        return
+
+    phase_elapsed = elapsed_seconds - _train_phased_phase_start_seconds
+    if phase_elapsed < args.train_phased_adaptive_min_seconds:
+        return
+
+    pool_learned = pool_score >= args.train_phased_adaptive_pool_threshold
+    val_drop = val <= _train_phased_phase_peak_val - args.train_phased_adaptive_val_drop
+    no_improve_twice = (
+        len(_train_phased_val_eval_history) >= 3
+        and _train_phased_val_eval_history[-1] <= _train_phased_val_eval_history[-2]
+        and _train_phased_val_eval_history[-2] <= _train_phased_val_eval_history[-3]
+    )
+    if pool_learned and (val_drop or no_improve_twice):
+        trigger = "val_drop" if val_drop else "val_stagnation"
+        _advance_phased_pool(elapsed_seconds, reason=f"pool>={pool_score:.3f}, {trigger}")
+
+
 def _active_phased_pool(elapsed_seconds: float) -> tuple[int, np.ndarray]:
     assert _train_phased_subsets is not None and _train_phased_durations is not None
+    if args.train_phased_adaptive:
+        _maybe_force_adaptive_phase_cap(elapsed_seconds)
+        idx = min(_train_phased_adaptive_idx, len(_train_phased_subsets) - 1)
+        return idx, _train_phased_subsets[idx]
     cumulative = 0.0
     for phase_idx, duration in enumerate(_train_phased_durations):
         cumulative += duration
@@ -464,6 +573,13 @@ if args.track:
 _init_train_phased_subsets(run_out_dir)
 if args.train_phased_subset_sizes is not None and not args.random_train_prompts:
     raise ValueError("train_phased_subset_sizes requires --random-train-prompts")
+if args.train_phased_adaptive:
+    if args.train_phased_subset_sizes is None:
+        raise ValueError("train_phased_adaptive requires train_phased_subset_sizes")
+    if args.eval_train_every is None or args.eval_train_every <= 0:
+        raise ValueError("train_phased_adaptive requires --eval-train-every")
+    if args.eval_train_every != args.validate_every:
+        raise ValueError("train_phased_adaptive requires eval_train_every == validate_every")
 
 
 def _epoch_train_indices(epoch: int, elapsed_seconds: float) -> np.ndarray:
@@ -534,6 +650,9 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         print(f"TRAIN EVAL (active pool, n={len(active_pool)})")
         active_pool_train_eval_score = train_eval(params, epoch, active_pool)
         print("ACTIVE POOL TRAIN EVAL SCORE=", active_pool_train_eval_score)
+        _check_adaptive_phased_switch(
+            elapsed_seconds, validation_score, active_pool_train_eval_score
+        )
     if epoch % args.validate_every == 0:
         if hellaswag_validate is not None:
             print("HELLASWAG VALIDATION")
@@ -762,6 +881,9 @@ for epoch in tqdm.trange(args.num_epochs):
     noiser_params, params, true_train_fitness_sum = single_epoch(
         noiser_params, params, true_train_fitness_sum, epoch, time.time() - run_start_time
     )
+    if _adaptive_stop_training:
+        print(f"Adaptive policy stop after epoch {epoch}.")
+        break
     budget = _effective_time_budget_seconds()
     if budget is not None and (time.time() - run_start_time) >= budget:
         print(f"Time budget ({budget}s) reached after epoch {epoch}. Stopping.")
