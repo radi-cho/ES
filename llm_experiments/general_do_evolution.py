@@ -92,6 +92,14 @@ class Args:
 
     generations_per_prompt: int = 8
 
+    # Used only by diag_eggroll; the baseline path below is unchanged.
+    diag_geometry_lr: float = 0.02
+    diag_geometry_ema_decay: float = 0.9
+    diag_geometry_warmup_pairs: int = 64
+    diag_geometry_update_every: int = 1
+    diag_geometry_condition_cap: float = 2.0
+    diag_geometry_utility_clip: float = 3.0
+
     train_dataset_size: Optional[int] = None
     val_dataset_size: Optional[int] = None
     time_budget_seconds: Optional[float] = None
@@ -414,7 +422,24 @@ def shard_on_data(x):
     return jax.sharding.reshard(arr, sharding)
 
 params = jax.tree.map(replicate_matrix, params)
-frozen_noiser_params, noiser_params = NOISER.init_noiser(params, args.sigma, args.lr_scale, group_size=args.generations_per_prompt, freeze_nonlora=args.freeze_nonlora, noise_reuse=args.noise_reuse)
+if args.noiser == "diag_eggroll":
+    frozen_noiser_params, noiser_params = NOISER.init_noiser(
+        params,
+        args.sigma,
+        args.lr_scale,
+        group_size=args.generations_per_prompt,
+        freeze_nonlora=args.freeze_nonlora,
+        noise_reuse=args.noise_reuse,
+        es_map=es_map,
+        diag_geometry_lr=args.diag_geometry_lr,
+        diag_geometry_ema_decay=args.diag_geometry_ema_decay,
+        diag_geometry_warmup_pairs=args.diag_geometry_warmup_pairs,
+        diag_geometry_update_every=args.diag_geometry_update_every,
+        diag_geometry_condition_cap=args.diag_geometry_condition_cap,
+        diag_geometry_utility_clip=args.diag_geometry_utility_clip,
+    )
+else:
+    frozen_noiser_params, noiser_params = NOISER.init_noiser(params, args.sigma, args.lr_scale, group_size=args.generations_per_prompt, freeze_nonlora=args.freeze_nonlora, noise_reuse=args.noise_reuse)
 base_evo_keys = simple_es_tree_key(params, base_model_key, scan_map)
 
 
@@ -795,6 +820,10 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         "update_time": parameter_update_time,
         "true_train_avg_fitness": true_train_fitness_sum / ((epoch + 1) * args.total_parallel_generations)
     }
+    if args.noiser == "diag_eggroll":
+        from hyperscalees.noiser.diag_eggroll import geometry_diagnostics
+
+        stats.update(geometry_diagnostics(noiser_params))
 
     if validation_score is not None:
         stats["validation_score"] = validation_score
