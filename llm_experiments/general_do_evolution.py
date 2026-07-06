@@ -100,6 +100,16 @@ class Args:
     diag_geometry_condition_cap: float = 2.0
     diag_geometry_utility_clip: float = 3.0
 
+    # Used only by product_space_eggroll; EGGROLL and diag_eggroll keep their
+    # existing initialization paths below.
+    product_space_rank: int = 8
+    product_space_scout_pairs: int = 2
+    product_space_warmup_pairs: int = 256
+    product_space_geometry_lr: float = 0.02
+    product_space_geometry_ema_decay: float = 0.9
+    product_space_geometry_update_every: int = 1
+    product_space_control_variate: bool = True
+
     train_dataset_size: Optional[int] = None
     val_dataset_size: Optional[int] = None
     time_budget_seconds: Optional[float] = None
@@ -437,6 +447,24 @@ if args.noiser == "diag_eggroll":
         diag_geometry_update_every=args.diag_geometry_update_every,
         diag_geometry_condition_cap=args.diag_geometry_condition_cap,
         diag_geometry_utility_clip=args.diag_geometry_utility_clip,
+    )
+elif args.noiser == "product_space_eggroll":
+    frozen_noiser_params, noiser_params = NOISER.init_noiser(
+        params,
+        args.sigma,
+        args.lr_scale,
+        group_size=args.generations_per_prompt,
+        freeze_nonlora=args.freeze_nonlora,
+        noise_reuse=args.noise_reuse,
+        es_map=es_map,
+        product_space_rank=args.product_space_rank,
+        product_space_scout_pairs=args.product_space_scout_pairs,
+        product_space_warmup_pairs=args.product_space_warmup_pairs,
+        product_space_geometry_lr=args.product_space_geometry_lr,
+        product_space_geometry_ema_decay=args.product_space_geometry_ema_decay,
+        product_space_geometry_update_every=args.product_space_geometry_update_every,
+        product_space_control_variate=args.product_space_control_variate,
+        product_space_seed=args.seed,
     )
 else:
     frozen_noiser_params, noiser_params = NOISER.init_noiser(params, args.sigma, args.lr_scale, group_size=args.generations_per_prompt, freeze_nonlora=args.freeze_nonlora, noise_reuse=args.noise_reuse)
@@ -822,6 +850,10 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
     }
     if args.noiser == "diag_eggroll":
         from hyperscalees.noiser.diag_eggroll import geometry_diagnostics
+
+        stats.update(geometry_diagnostics(noiser_params))
+    elif args.noiser == "product_space_eggroll":
+        from hyperscalees.noiser.product_space_eggroll import geometry_diagnostics
 
         stats.update(geometry_diagnostics(noiser_params))
 
