@@ -1,7 +1,6 @@
 import os
 import sys
 import csv
-import json
 import jax
 from huggingface_hub.constants import HF_HOME
 
@@ -20,6 +19,18 @@ from hyperscalees.models.llm.tokenizer import LegacyWorldTokenizer
 from hyperscalees.models.common import simple_es_tree_key
 
 from hyperscalees.noiser import all_noisers
+from hyperscalees.noiser.adaptive_surrogate_eggroll import (
+    assemble_member_fitness,
+    compute_trust_score,
+    observed_member_fitness_to_pair_differences,
+    pair_differences_to_member_fitness,
+    pair_ids_to_member_ids,
+    sample_surrogate_pair_mask,
+)
+from hyperscalees.noiser.predictive_eggroll import (
+    OnlinePromptRidge,
+    build_mutation_feature_fn,
+)
 from hyperscalees.environments.llm_bandits import all_tasks, validation_tasks
 
 import tyro
@@ -39,7 +50,6 @@ from hydra.utils import instantiate
 from .utils import (
     build_generate_thread, 
     build_validate,
-    build_train_eval,
     build_hellaswag_validate,
     safe_decode
 )
@@ -78,7 +88,6 @@ class Args:
     temperature: float = 0.0
 
     validate_every: int = 10
-    eval_train_every: Optional[int] = None
     parallel_validations: int = 128
     validation_iterations: int = 10
 
@@ -92,18 +101,20 @@ class Args:
 
     generations_per_prompt: int = 8
 
+    # Adaptive surrogate fitness for physical EGGROLL rollouts.
+    surrogate_probes_per_matrix: int = 2
+    surrogate_ridge: float = 16.0
+    surrogate_replay_capacity: int = 64
+    surrogate_min_observations: int = 4
+    surrogate_prediction_clip: float = 1.0
+    surrogate_feature_seed: int = 0
+    surrogate_max_fraction: float = 0.8
+    surrogate_global_fallback: bool = True
+
     train_dataset_size: Optional[int] = None
     val_dataset_size: Optional[int] = None
     time_budget_seconds: Optional[float] = None
     random_train_prompts: bool = False
-    train_phased_subset_sizes: Optional[str] = None
-    train_phased_durations_seconds: Optional[str] = None
-    train_phased_split_seed: Optional[int] = None
-    train_phased_adaptive: bool = False
-    train_phased_adaptive_pool_threshold: float = 0.90
-    train_phased_adaptive_val_drop: float = 0.03
-    train_phased_adaptive_early_stop_val_drop: float = 0.03
-    train_phased_adaptive_min_seconds: float = 600.0
     aux_validation_task: Optional[Literal["hellaswag"]] = None
     hellaswag_val_size: int = 256
     hellaswag_val_seed: int = 42
@@ -168,12 +179,29 @@ print()
 print("per-device generations is", args.parallel_generations_per_gpu)
 print("full number of generations is", args.total_parallel_generations)
 
+args.prompts_per_epoch = args.total_parallel_generations // args.generations_per_prompt
+
+ADAPTIVE_SURROGATE_MODE = args.noiser == "adaptive_surrogate_eggroll"
+if ADAPTIVE_SURROGATE_MODE:
+    if args.generations_per_prompt < 2 or args.generations_per_prompt % 2:
+        raise ValueError(
+            "adaptive_surrogate_eggroll needs positive, even generations_per_prompt"
+        )
+    if total_num_devices != 1:
+        raise ValueError(
+            "adaptive_surrogate_eggroll currently supports one visible device"
+        )
+    if not args.freeze_nonlora:
+        raise ValueError(
+            "adaptive_surrogate_eggroll currently requires freeze_nonlora"
+        )
+    args.pairs_per_prompt = args.generations_per_prompt // 2
+    args.total_pairs = args.prompts_per_epoch * args.pairs_per_prompt
+
 RWKV, full_params, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
 legacy_tokenizer = LegacyWorldTokenizer() if args.model_choice[0] == "7" else tokenizer
 
 config, params, scan_map, es_map = full_params
-
-args.prompts_per_epoch = args.total_parallel_generations // args.generations_per_prompt
 
 def _task_kwargs(task_name: str, *, dataset_size: Optional[int], seed: Optional[int], val_holdout_size: Optional[int] = None) -> dict:
     if task_name != "countdown_chat":
@@ -207,185 +235,6 @@ if args.random_train_prompts:
             f"<= train dataset size ({len(Task)})"
         )
     print(f"Random train prompt sampling: {args.prompts_per_epoch} unique examples per epoch")
-
-_train_phased_subsets: Optional[list[np.ndarray]] = None
-_train_phased_durations: Optional[list[float]] = None
-_train_phased_active_idx: int = -1
-_train_phased_adaptive_idx: int = 0
-_train_phased_phase_start_seconds: float = 0.0
-_train_phased_phase_peak_val: float = float("-inf")
-_train_phased_global_best_val: float = float("-inf")
-_train_phased_val_eval_history: list[float] = []
-_adaptive_stop_training: bool = False
-
-
-def _init_train_phased_subsets(run_dir: Path) -> None:
-    global _train_phased_subsets, _train_phased_durations, _train_phased_active_idx
-    if args.train_phased_subset_sizes is None:
-        _train_phased_subsets = None
-        _train_phased_durations = None
-        return
-
-    sizes = [int(x.strip()) for x in args.train_phased_subset_sizes.split(",") if x.strip()]
-    if not sizes:
-        raise ValueError("train_phased_subset_sizes must list at least one subset size")
-    if sum(sizes) != len(Task):
-        raise ValueError(
-            f"train_phased_subset_sizes ({sizes}) must sum to train dataset size ({len(Task)})"
-        )
-    if args.train_phased_durations_seconds is None:
-        raise ValueError("train_phased_durations_seconds is required with train_phased_subset_sizes")
-    durations = [
-        float(x.strip())
-        for x in args.train_phased_durations_seconds.split(",")
-        if x.strip()
-    ]
-    if len(durations) != len(sizes):
-        raise ValueError(
-            f"train_phased_durations_seconds ({durations}) must match "
-            f"train_phased_subset_sizes ({sizes})"
-        )
-
-    split_seed = args.train_phased_split_seed if args.train_phased_split_seed is not None else args.seed
-    rng = np.random.default_rng(split_seed)
-    perm = rng.permutation(len(Task)).astype(np.int32)
-    subsets: list[np.ndarray] = []
-    offset = 0
-    for size in sizes:
-        subsets.append(perm[offset : offset + size])
-        offset += size
-
-    _train_phased_subsets = subsets
-    _train_phased_durations = durations
-    _train_phased_active_idx = -1
-
-    mode = "adaptive" if args.train_phased_adaptive else "fixed wall-clock"
-    print(
-        f"Phased train pools ({mode}): {len(subsets)} phases, "
-        f"durations={durations}s, split_seed={split_seed}"
-    )
-    if args.train_phased_adaptive:
-        print(
-            f"  Adaptive switch: pool>={args.train_phased_adaptive_pool_threshold}, "
-            f"val drop>={args.train_phased_adaptive_val_drop}, "
-            f"min_phase={args.train_phased_adaptive_min_seconds}s, "
-            f"early_stop_val_drop={args.train_phased_adaptive_early_stop_val_drop}"
-        )
-    for phase_idx, (subset, duration) in enumerate(zip(subsets, durations)):
-        cap = f"max {duration}s" if args.train_phased_adaptive else f"{duration}s"
-        print(
-            f"  Phase {phase_idx + 1}: {len(subset)} examples for {cap}, "
-            f"indices={subset.tolist()}"
-        )
-
-    phase_meta = {
-        "split_seed": split_seed,
-        "subset_sizes": sizes,
-        "durations_seconds": durations,
-        "adaptive": args.train_phased_adaptive,
-        "adaptive_pool_threshold": args.train_phased_adaptive_pool_threshold,
-        "adaptive_val_drop": args.train_phased_adaptive_val_drop,
-        "adaptive_early_stop_val_drop": args.train_phased_adaptive_early_stop_val_drop,
-        "adaptive_min_seconds": args.train_phased_adaptive_min_seconds,
-        "subsets": [subset.tolist() for subset in subsets],
-    }
-    phase_path = run_dir / "train_phased_subsets.json"
-    phase_path.write_text(json.dumps(phase_meta, indent=2), encoding="utf-8")
-    print(f"Saved phased train split: {phase_path}")
-
-
-def _advance_phased_pool(elapsed_seconds: float, reason: str) -> None:
-    global _train_phased_adaptive_idx, _train_phased_phase_start_seconds
-    global _train_phased_phase_peak_val, _train_phased_val_eval_history
-    assert _train_phased_subsets is not None
-    if _train_phased_adaptive_idx >= len(_train_phased_subsets) - 1:
-        return
-    _train_phased_adaptive_idx += 1
-    _train_phased_phase_start_seconds = elapsed_seconds
-    _train_phased_phase_peak_val = float("-inf")
-    _train_phased_val_eval_history = []
-    pool = _train_phased_subsets[_train_phased_adaptive_idx]
-    print(
-        f"Adaptive phase switch ({reason}) -> "
-        f"phase {_train_phased_adaptive_idx + 1}/{len(_train_phased_subsets)}: "
-        f"{len(pool)} examples, indices={pool.tolist()}"
-    )
-
-
-def _maybe_force_adaptive_phase_cap(elapsed_seconds: float) -> None:
-    """Force-advance when the current phase exceeds its max duration cap."""
-    assert _train_phased_subsets is not None and _train_phased_durations is not None
-    while _train_phased_adaptive_idx < len(_train_phased_subsets) - 1:
-        phase_elapsed = elapsed_seconds - _train_phased_phase_start_seconds
-        if phase_elapsed < _train_phased_durations[_train_phased_adaptive_idx]:
-            break
-        _advance_phased_pool(elapsed_seconds, reason="max_phase_duration")
-
-
-def _check_adaptive_phased_switch(
-    elapsed_seconds: float,
-    validation_score: Optional[float],
-    active_pool_score: Optional[float],
-) -> None:
-    global _train_phased_global_best_val, _train_phased_phase_peak_val
-    global _train_phased_val_eval_history, _adaptive_stop_training
-    if not args.train_phased_adaptive or validation_score is None or active_pool_score is None:
-        return
-
-    val = float(validation_score)
-    pool_score = float(active_pool_score)
-    _train_phased_global_best_val = max(_train_phased_global_best_val, val)
-    _train_phased_phase_peak_val = max(_train_phased_phase_peak_val, val)
-    _train_phased_val_eval_history.append(val)
-
-    if (
-        len(_train_phased_val_eval_history) >= 2
-        and _train_phased_global_best_val > 0.0
-        and all(
-            v <= _train_phased_global_best_val - args.train_phased_adaptive_early_stop_val_drop
-            for v in _train_phased_val_eval_history[-2:]
-        )
-    ):
-        _adaptive_stop_training = True
-        print(
-            "Adaptive early stop: validation at or below "
-            f"{_train_phased_global_best_val - args.train_phased_adaptive_early_stop_val_drop:.4f} "
-            "for 2 consecutive evals"
-        )
-        return
-
-    if _train_phased_adaptive_idx >= len(_train_phased_subsets) - 1:
-        return
-
-    phase_elapsed = elapsed_seconds - _train_phased_phase_start_seconds
-    if phase_elapsed < args.train_phased_adaptive_min_seconds:
-        return
-
-    pool_learned = pool_score >= args.train_phased_adaptive_pool_threshold
-    val_drop = val <= _train_phased_phase_peak_val - args.train_phased_adaptive_val_drop
-    no_improve_twice = (
-        len(_train_phased_val_eval_history) >= 3
-        and _train_phased_val_eval_history[-1] <= _train_phased_val_eval_history[-2]
-        and _train_phased_val_eval_history[-2] <= _train_phased_val_eval_history[-3]
-    )
-    if pool_learned and (val_drop or no_improve_twice):
-        trigger = "val_drop" if val_drop else "val_stagnation"
-        _advance_phased_pool(elapsed_seconds, reason=f"pool>={pool_score:.3f}, {trigger}")
-
-
-def _active_phased_pool(elapsed_seconds: float) -> tuple[int, np.ndarray]:
-    assert _train_phased_subsets is not None and _train_phased_durations is not None
-    if args.train_phased_adaptive:
-        _maybe_force_adaptive_phase_cap(elapsed_seconds)
-        idx = min(_train_phased_adaptive_idx, len(_train_phased_subsets) - 1)
-        return idx, _train_phased_subsets[idx]
-    cumulative = 0.0
-    for phase_idx, duration in enumerate(_train_phased_durations):
-        cumulative += duration
-        if elapsed_seconds < cumulative:
-            return phase_idx, _train_phased_subsets[phase_idx]
-    return len(_train_phased_subsets) - 1, _train_phased_subsets[-1]
-
 
 def replicate_matrix(x):
     if not USE_SHARD_MAP:
@@ -466,22 +315,13 @@ print("Compile time", time.time() - start_time)
 print("memory info")
 print(generate_batch.memory_analysis())
 
-validate = build_validate(RWKV, config, params, base_evo_keys, base_valid_key, tokenizer, legacy_tokenizer, args, args.temperature, suppress_eos_token=suppress_eos_token)
-
-train_eval = None
-if args.eval_train_every is not None and args.eval_train_every > 0:
-    train_eval = build_train_eval(
-        RWKV,
-        config,
-        params,
-        base_evo_keys,
-        base_gen_key,
-        Task,
-        args,
-        NOISER=NOISER,
-        temperature=args.temperature,
-        suppress_eos_token=suppress_eos_token,
+generate_subset = None
+if ADAPTIVE_SURROGATE_MODE:
+    generate_subset = jax.jit(
+        jax.vmap(_generate_thread, in_axes=(None, None, 0, 0, None))
     )
+
+validate = build_validate(RWKV, config, params, base_evo_keys, base_valid_key, tokenizer, legacy_tokenizer, args, args.temperature, suppress_eos_token=suppress_eos_token)
 
 hellaswag_validate = None
 hellaswag_csv_path = None
@@ -534,6 +374,49 @@ print("Compile time", time.time() - start_time)
 print("memory info")
 print(do_update.memory_analysis())
 
+surrogate_feature_batch = None
+surrogate_feature_info = None
+surrogate_predictor = None
+surrogate_trust_alpha = 0.0
+if ADAPTIVE_SURROGATE_MODE:
+    feature_fn, surrogate_feature_info = build_mutation_feature_fn(
+        params,
+        base_evo_keys,
+        es_map,
+        frozen_noiser_params,
+        probes_per_matrix=args.surrogate_probes_per_matrix,
+        seed=args.surrogate_feature_seed,
+    )
+    physical_pair_ids = jnp.arange(args.total_pairs, dtype=jnp.int32)
+    print(
+        "Compiling surrogate mutation features",
+        f"({surrogate_feature_info.matrix_count} matrices, "
+        f"{surrogate_feature_info.feature_dim} features)",
+    )
+    start_time = time.time()
+    surrogate_feature_batch = jax.jit(feature_fn).lower(
+        params,
+        jax.ShapeDtypeStruct(physical_pair_ids.shape, jnp.dtype("int32")),
+        0,
+    ).compile()
+    print("Compile time", time.time() - start_time)
+    print("memory info")
+    print(surrogate_feature_batch.memory_analysis())
+    surrogate_predictor = OnlinePromptRidge(
+        num_prompts=len(Task),
+        feature_dim=surrogate_feature_info.feature_dim,
+        ridge=args.surrogate_ridge,
+        min_observations=args.surrogate_min_observations,
+        prediction_clip=args.surrogate_prediction_clip,
+        global_fallback=args.surrogate_global_fallback,
+        replay_capacity=args.surrogate_replay_capacity,
+    )
+    print(
+        "Adaptive surrogate fitness enabled:",
+        f"max_fraction={args.surrogate_max_fraction},",
+        f"trust_score=corr(pred, rollout) from previous epoch",
+    )
+
 true_train_fitness_sum = 0.0
 
 FULL = 0
@@ -550,7 +433,7 @@ run_out_dir.mkdir(parents=True, exist_ok=True)
 
 fitness_csv_path = run_out_dir / "fitness.csv"
 validation_csv_path = run_out_dir / "validation.csv"
-metrics_csv_path = run_out_dir / "metrics.csv"
+surrogate_csv_path = run_out_dir / "surrogate_mix.csv"
 hellaswag_csv_path = run_out_dir / "hellaswag_validation.csv"
 figure_4b_path = run_out_dir / "figure_4b.png"
 
@@ -570,41 +453,8 @@ if args.track:
         dir=str(wandb_dir),
     )
 
-_init_train_phased_subsets(run_out_dir)
-if args.train_phased_subset_sizes is not None and not args.random_train_prompts:
-    raise ValueError("train_phased_subset_sizes requires --random-train-prompts")
-if args.train_phased_adaptive:
-    if args.train_phased_subset_sizes is None:
-        raise ValueError("train_phased_adaptive requires train_phased_subset_sizes")
-    if args.eval_train_every is None or args.eval_train_every <= 0:
-        raise ValueError("train_phased_adaptive requires --eval-train-every")
-    if args.eval_train_every != args.validate_every:
-        raise ValueError("train_phased_adaptive requires eval_train_every == validate_every")
-
-
-def _epoch_train_indices(epoch: int, elapsed_seconds: float) -> np.ndarray:
+def _epoch_train_indices(epoch: int) -> np.ndarray:
     """Dataset row indices for this epoch's unique train prompts."""
-    global _train_phased_active_idx
-
-    if _train_phased_subsets is not None:
-        phase_idx, pool = _active_phased_pool(elapsed_seconds)
-        if phase_idx != _train_phased_active_idx:
-            _train_phased_active_idx = phase_idx
-            print(
-                f"Train phase {phase_idx + 1}/{len(_train_phased_subsets)} active: "
-                f"{len(pool)} examples, indices={pool.tolist()}"
-            )
-        if args.random_train_prompts:
-            if args.prompts_per_epoch > len(pool):
-                raise ValueError(
-                    f"random_train_prompts needs prompts_per_epoch ({args.prompts_per_epoch}) "
-                    f"<= active phased pool size ({len(pool)})"
-                )
-            rng = np.random.default_rng(args.seed + epoch)
-            return rng.choice(pool, size=args.prompts_per_epoch, replace=False)
-        start = epoch * args.prompts_per_epoch
-        return pool[start : start + args.prompts_per_epoch]
-
     if args.random_train_prompts:
         rng = np.random.default_rng(args.seed + epoch)
         return rng.choice(len(Task), size=args.prompts_per_epoch, replace=False)
@@ -612,55 +462,22 @@ def _epoch_train_indices(epoch: int, elapsed_seconds: float) -> np.ndarray:
     return np.arange(start, start + args.prompts_per_epoch, dtype=np.int32)
 
 
-def _current_train_phase(elapsed_seconds: float) -> int:
-    if _train_phased_subsets is None:
-        return -1
-    phase_idx, _ = _active_phased_pool(elapsed_seconds)
-    return phase_idx
-
-
-def _active_train_pool_indices(elapsed_seconds: float) -> np.ndarray:
-    if _train_phased_subsets is None:
-        return np.arange(len(Task), dtype=np.int32)
-    _, pool = _active_phased_pool(elapsed_seconds)
-    return pool
-
-
-def _mean_tree_rms(tree) -> float:
-    leaves = jax.tree.leaves(tree)
-    if not leaves:
-        return 0.0
-    return float(jnp.mean(jnp.array([jnp.mean(x) for x in leaves])))
-
-
-def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_seconds: float):
+def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, surrogate_trust_alpha):
     validation_score = None
-    train_eval_score = None
-    active_pool_train_eval_score = None
     hellaswag_score = None
+    next_surrogate_trust_alpha = surrogate_trust_alpha
+    surrogate_stats = {}
     if epoch % args.validate_every == 0:
         print("VALIDATION")
         validation_score = validate(params, epoch)
         print("VALIDATION SCORE=", validation_score)
-    if train_eval is not None and epoch % args.eval_train_every == 0:
-        active_pool = _active_train_pool_indices(elapsed_seconds)
-        print("TRAIN EVAL (all 30)")
-        train_eval_score = train_eval(params, epoch)
-        print("TRAIN EVAL SCORE=", train_eval_score)
-        print(f"TRAIN EVAL (active pool, n={len(active_pool)})")
-        active_pool_train_eval_score = train_eval(params, epoch, active_pool)
-        print("ACTIVE POOL TRAIN EVAL SCORE=", active_pool_train_eval_score)
-        _check_adaptive_phased_switch(
-            elapsed_seconds, validation_score, active_pool_train_eval_score
-        )
-    if epoch % args.validate_every == 0:
         if hellaswag_validate is not None:
             print("HELLASWAG VALIDATION")
             hellaswag_score = hellaswag_validate(params, epoch)
             print("HELLASWAG SCORE=", hellaswag_score)
     # print("CURRENT MEMORY start of epoch", jax.local_devices()[0].memory_stats())
     start_time = time.time()
-    train_indices = _epoch_train_indices(epoch, elapsed_seconds)
+    train_indices = _epoch_train_indices(epoch)
     if args.random_train_prompts and epoch % args.validate_every == 0:
         print(f"Epoch {epoch} train indices: {train_indices.tolist()}")
     if USE_SHARD_MAP:
@@ -680,97 +497,253 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         batch_prompts = jnp.repeat(unique_prompts, args.generations_per_prompt, axis=0)
     prompt_processing_time = time.time() - start_time
 
+    surrogate_stats = {}
+    pair_features = None
+    pair_prompt_ids = None
+    predicted_pair_differences = None
+    surrogate_pair_mask = None
+    rollout_pair_ids = None
+    feature_time = 0.0
+    if ADAPTIVE_SURROGATE_MODE:
+        start_time = time.time()
+        physical_pair_ids = jnp.arange(args.total_pairs, dtype=jnp.int32)
+        pair_features = np.asarray(
+            jax.device_get(
+                surrogate_feature_batch(params, physical_pair_ids, epoch)
+            ),
+            dtype=np.float32,
+        )
+        pair_prompt_ids = np.repeat(
+            np.asarray(train_indices, dtype=np.int32), args.pairs_per_prompt
+        )
+        predicted_pair_differences = surrogate_predictor.predict(
+            pair_features, pair_prompt_ids
+        )
+        surrogate_fraction = min(
+            float(surrogate_trust_alpha), float(args.surrogate_max_fraction)
+        )
+        surrogate_pair_mask = sample_surrogate_pair_mask(
+            num_prompts=args.prompts_per_epoch,
+            pairs_per_prompt=args.pairs_per_prompt,
+            surrogate_fraction=surrogate_fraction,
+            seed=args.seed,
+            epoch=epoch,
+        )
+        rollout_pair_ids = np.flatnonzero(~surrogate_pair_mask).astype(np.int32)
+        feature_time = time.time() - start_time
+
     # print("CURRENT MEMORY start of batch", jax.local_devices()[0].memory_stats())
     start_time = time.time()
     if epoch == 0:
         print("generating batch")
-    thread_idxes = all_thread_idxes if USE_SHARD_MAP else jnp.arange(args.total_parallel_generations, dtype=jnp.int32)
-    output_batch = jax.block_until_ready(
-        generate_batch(noiser_params, params, batch_prompts, thread_idxes, epoch)
-    )
-    token_generation_time = time.time() - start_time
-
-    if (
-        args.track
-        and args.log_output_every > 0
-        and (epoch % args.log_output_every == 0)
-        and jax.process_index() == 0
-    ):
-        # Take a small sample from the first local shard to minimize overhead
-        K = min(8, args.total_parallel_generations)
-
-        if USE_SHARD_MAP:
-            local_gen = np.array(output_batch.addressable_shards[0].data)[:K]
-            local_prompts = np.array(batch_prompts.addressable_shards[0].data)[:K]
+    if ADAPTIVE_SURROGATE_MODE:
+        rollout_member_ids = pair_ids_to_member_ids(rollout_pair_ids)
+        if rollout_member_ids.size:
+            if USE_SHARD_MAP:
+                rollout_prompts = shard_on_data(
+                    np.asarray(batch_prompts)[rollout_member_ids]
+                )
+                rollout_indices = jnp.asarray(indices)[rollout_member_ids]
+                rollout_thread_idxes = jnp.asarray(rollout_member_ids, dtype=jnp.int32)
+                output_rollout = jax.block_until_ready(
+                    generate_subset(
+                        noiser_params,
+                        params,
+                        rollout_prompts,
+                        rollout_thread_idxes,
+                        epoch,
+                    )
+                )
+                _local_fitness = [
+                    jax.device_put(
+                        Task.get_batch_fitness(
+                            jax.device_put(
+                                rollout_indices.addressable_shards[i].data,
+                                jax.local_devices(backend="cpu")[0],
+                            ),
+                            jax.device_put(
+                                output_rollout.addressable_shards[i].data,
+                                jax.local_devices(backend="cpu")[0],
+                            ),
+                        ),
+                        rollout_indices.addressable_shards[i].device,
+                    )
+                    for i in range(len(rollout_indices.addressable_shards))
+                ]
+                rollout_scores = np.concatenate(
+                    [np.asarray(x) for x in _local_fitness], axis=0
+                ).astype(np.float32)
+            else:
+                rollout_prompts = jnp.asarray(batch_prompts)[jnp.asarray(rollout_member_ids)]
+                rollout_indices = indices[jnp.asarray(rollout_member_ids)]
+                rollout_thread_idxes = jnp.asarray(rollout_member_ids, dtype=jnp.int32)
+                output_rollout = jax.block_until_ready(
+                    generate_subset(
+                        noiser_params,
+                        params,
+                        rollout_prompts,
+                        rollout_thread_idxes,
+                        epoch,
+                    )
+                )
+                idx_cpu = jax.device_put(
+                    rollout_indices, jax.local_devices(backend="cpu")[0]
+                )
+                out_cpu = jax.device_put(
+                    output_rollout, jax.local_devices(backend="cpu")[0]
+                )
+                rollout_scores = np.asarray(
+                    Task.get_batch_fitness(idx_cpu, out_cpu), dtype=np.float32
+                )
         else:
-            local_gen = np.array(output_batch)[:K]
-            local_prompts = np.array(batch_prompts)[:K]
-
-        rows = []
-        for i in range(local_gen.shape[0]):
-            prompt_txt = safe_decode(local_prompts[i], tokenizer)
-            gen_txt = safe_decode(local_gen[i], tokenizer)
-            rows.append([epoch, i, prompt_txt, gen_txt])
-
-        table = wandb.Table(columns=["epoch", "sample_id", "prompt", "generation"], rows=rows)
-        wandb.log({"text_samples": table}, step=epoch)
-        
-        epoch_dir = run_out_dir / f"epoch_{epoch:05d}"
-        epoch_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = epoch_dir / f"outputs_rank{args.proc_id}.csv"
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["epoch", "global_idx", "prompt", "generation"])
-            writer.writerows(rows)
-    
-    start_time = time.time()
-    if epoch == 0:
-        print("calculating fitness")
-    # local_output_scores = jax.block_until_ready(Task.get_batch_fitness(indices, output_batch))
-    if USE_SHARD_MAP:
-        _local_fitness = [
-            jax.device_put(
-                Task.get_batch_fitness(
-                    jax.device_put(shard1.data, jax.local_devices(backend="cpu")[0]),
-                    jax.device_put(shard2.data, jax.local_devices(backend="cpu")[0]),
-                ),
-                shard1.device,
+            rollout_member_ids = np.asarray([], dtype=np.int32)
+            rollout_scores = np.asarray([], dtype=np.float32)
+        predicted_member_fitness = pair_differences_to_member_fitness(
+            predicted_pair_differences
+        )
+        output_scores_np, rollout_pair_count, surrogate_pair_count = (
+            assemble_member_fitness(
+                total_members=args.total_parallel_generations,
+                predicted_member_fitness=predicted_member_fitness,
+                rollout_member_fitness=rollout_scores,
+                rollout_member_ids=rollout_member_ids,
+                surrogate_pair_mask=surrogate_pair_mask,
             )
-            for shard1, shard2 in zip(indices.addressable_shards, output_batch.addressable_shards)
-        ]
-        local_fitness = jax.make_array_from_single_device_arrays(
-            (args.total_parallel_generations,), NamedSharding(mesh, P("data")), _local_fitness
         )
+        output_scores = jnp.asarray(output_scores_np)
+        token_generation_time = time.time() - start_time
+        fitness_time = 0.0
+        gather_time = 0.0
     else:
-        idx_cpu = jax.device_put(indices, jax.local_devices(backend="cpu")[0])
-        out_cpu = jax.device_put(output_batch, jax.local_devices(backend="cpu")[0])
-        local_fitness = jax.device_put(
-            Task.get_batch_fitness(idx_cpu, out_cpu), jax.local_devices()[0]
+        thread_idxes = (
+            all_thread_idxes
+            if USE_SHARD_MAP
+            else jnp.arange(args.total_parallel_generations, dtype=jnp.int32)
         )
+        output_batch = jax.block_until_ready(
+            generate_batch(noiser_params, params, batch_prompts, thread_idxes, epoch)
+        )
+        token_generation_time = time.time() - start_time
 
-    fitness_time = time.time() - start_time
+        if (
+            args.track
+            and args.log_output_every > 0
+            and (epoch % args.log_output_every == 0)
+            and jax.process_index() == 0
+        ):
+            # Take a small sample from the first local shard to minimize overhead
+            K = min(8, args.total_parallel_generations)
 
-    # print("CURRENT MEMORY start of update", jax.local_devices()[0].memory_stats())
-    start_time = time.time()
-    if epoch == 0:
-        print("gathering")
-    output_scores = process_allgather(local_fitness, True) if USE_SHARD_MAP else local_fitness
-    if USE_SHARD_MAP:
-        output_scores = jax.sharding.reshard(output_scores, NamedSharding(mesh, P("data")))
-    gather_time = time.time() - start_time
+            if USE_SHARD_MAP:
+                local_gen = np.array(output_batch.addressable_shards[0].data)[:K]
+                local_prompts = np.array(batch_prompts.addressable_shards[0].data)[:K]
+            else:
+                local_gen = np.array(output_batch)[:K]
+                local_prompts = np.array(batch_prompts)[:K]
 
+            rows = []
+            for i in range(local_gen.shape[0]):
+                prompt_txt = safe_decode(local_prompts[i], tokenizer)
+                gen_txt = safe_decode(local_gen[i], tokenizer)
+                rows.append([epoch, i, prompt_txt, gen_txt])
 
+            table = wandb.Table(columns=["epoch", "sample_id", "prompt", "generation"], rows=rows)
+            wandb.log({"text_samples": table}, step=epoch)
+            
+            epoch_dir = run_out_dir / f"epoch_{epoch:05d}"
+            epoch_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = epoch_dir / f"outputs_rank{args.proc_id}.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["epoch", "global_idx", "prompt", "generation"])
+                writer.writerows(rows)
+        
+        start_time = time.time()
+        if epoch == 0:
+            print("calculating fitness")
+        if USE_SHARD_MAP:
+            _local_fitness = [
+                jax.device_put(
+                    Task.get_batch_fitness(
+                        jax.device_put(shard1.data, jax.local_devices(backend="cpu")[0]),
+                        jax.device_put(shard2.data, jax.local_devices(backend="cpu")[0]),
+                    ),
+                    shard1.device,
+                )
+                for shard1, shard2 in zip(indices.addressable_shards, output_batch.addressable_shards)
+            ]
+            local_fitness = jax.make_array_from_single_device_arrays(
+                (args.total_parallel_generations,), NamedSharding(mesh, P("data")), _local_fitness
+            )
+        else:
+            idx_cpu = jax.device_put(indices, jax.local_devices(backend="cpu")[0])
+            out_cpu = jax.device_put(output_batch, jax.local_devices(backend="cpu")[0])
+            local_fitness = jax.device_put(
+                Task.get_batch_fitness(idx_cpu, out_cpu), jax.local_devices()[0]
+            )
+
+        fitness_time = time.time() - start_time
+
+        start_time = time.time()
+        if epoch == 0:
+            print("gathering")
+        output_scores = process_allgather(local_fitness, True) if USE_SHARD_MAP else local_fitness
+        if USE_SHARD_MAP:
+            output_scores = jax.sharding.reshard(output_scores, NamedSharding(mesh, P("data")))
+        gather_time = time.time() - start_time
     start_time = time.time()
     if epoch == 0:
         print("updating params")
-    noiser_params, params, parameter_differences = jax.block_until_ready(do_update(noiser_params, params, output_scores, epoch))
+    noiser_params, params, parameter_differences = jax.block_until_ready(
+        do_update(noiser_params, params, output_scores, epoch)
+    )
     parameter_update_time = time.time() - start_time
+
+    if ADAPTIVE_SURROGATE_MODE:
+        rollout_member_count = int(2 * rollout_pair_count)
+        surrogate_member_count = int(2 * surrogate_pair_count)
+        measured_trust_score = 0.0
+        if rollout_pair_ids.size:
+            observed_pair_differences = observed_member_fitness_to_pair_differences(
+                rollout_scores
+            )
+            audited_predictions = predicted_pair_differences[rollout_pair_ids]
+            measured_trust_score = compute_trust_score(
+                audited_predictions, observed_pair_differences
+            )
+            surrogate_predictor.update(
+                pair_features[rollout_pair_ids],
+                pair_prompt_ids[rollout_pair_ids],
+                observed_pair_differences,
+            )
+        next_surrogate_trust_alpha = min(
+            measured_trust_score, float(args.surrogate_max_fraction)
+        )
+        surrogate_stats = {
+            "surrogate_fraction_used": float(surrogate_pair_count)
+            / float(args.total_pairs),
+            "surrogate_pairs": surrogate_pair_count,
+            "rollout_pairs": rollout_pair_count,
+            "surrogate_members": surrogate_member_count,
+            "rollout_members": rollout_member_count,
+            "surrogate_trust_alpha_used": float(surrogate_trust_alpha),
+            "surrogate_trust_alpha_next": float(next_surrogate_trust_alpha),
+            "surrogate_trust_score": float(measured_trust_score),
+            "surrogate_feature_time": feature_time,
+            "surrogate_predictor_observations": surrogate_predictor.total_observations,
+        }
+        print(
+            f"Epoch {epoch} fitness mix: rollout_members={rollout_member_count}, "
+            f"surrogate_members={surrogate_member_count}, "
+            f"trust_used={surrogate_trust_alpha:.3f}, "
+            f"trust_score={measured_trust_score:.3f}, "
+            f"trust_next={next_surrogate_trust_alpha:.3f}"
+        )
 
     # print("CURRENT MEMORY start of stats", jax.local_devices()[0].memory_stats())
     # parameter_differences = jax.tree.map(lambda x, y:jnp.mean(jnp.abs(x-y)), params, updated_params)
     lora_updates = jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == LORA else 0.0, parameter_differences, es_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == LORA else 0.0, es_map))
     nonlora_updates = jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == FULL else 0.0, parameter_differences, es_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == FULL else 0.0, es_map))
-    total_update_rms = _mean_tree_rms(parameter_differences)
 
     # params = updated_params
 
@@ -784,8 +757,6 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         "median_fitness": jnp.median(output_scores),
         "lora_updates": lora_updates,
         "nonlora_updates": nonlora_updates,
-        "total_update_rms": total_update_rms,
-        "train_phase": _current_train_phase(elapsed_seconds),
         # "total_lora_updates": total_lora_updates,
         # "total_nonlora_updates": total_nonlora_updates,
         "prompt_preproc_time": prompt_processing_time,
@@ -795,30 +766,13 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         "update_time": parameter_update_time,
         "true_train_avg_fitness": true_train_fitness_sum / ((epoch + 1) * args.total_parallel_generations)
     }
+    stats.update(surrogate_stats)
 
     if validation_score is not None:
         stats["validation_score"] = validation_score
         elapsed = time.time() - run_start_time
         with open(validation_csv_path, "a", encoding="utf-8") as f:
             f.write(f"{epoch},{float(validation_score)},{elapsed:.3f}\n")
-    if train_eval_score is not None:
-        stats["train_eval_score"] = train_eval_score
-    if active_pool_train_eval_score is not None:
-        stats["active_pool_train_eval_score"] = active_pool_train_eval_score
-    if args.eval_train_every is not None and args.eval_train_every > 0:
-        elapsed = time.time() - run_start_time
-        phase = _current_train_phase(elapsed_seconds)
-        val_field = "" if validation_score is None else f"{float(validation_score):.9g}"
-        train_field = "" if train_eval_score is None else f"{float(train_eval_score):.9g}"
-        active_field = (
-            "" if active_pool_train_eval_score is None else f"{float(active_pool_train_eval_score):.9g}"
-        )
-        with open(metrics_csv_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"{epoch},{elapsed:.3f},{phase},{val_field},{train_field},{active_field},"
-                f"{float(jnp.mean(output_scores)):.9g},"
-                f"{float(lora_updates):.9g},{float(nonlora_updates):.9g},{total_update_rms:.9g}\n"
-            )
     if hellaswag_score is not None:
         stats["hellaswag_validation_score"] = hellaswag_score
         elapsed = time.time() - run_start_time
@@ -827,6 +781,15 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
 
     with open(fitness_csv_path, "a", encoding="utf-8") as f:
         f.write(f"{epoch},{float(jnp.mean(output_scores))}\n")
+    if ADAPTIVE_SURROGATE_MODE:
+        with open(surrogate_csv_path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{epoch},{surrogate_stats['rollout_members']},"
+                f"{surrogate_stats['surrogate_members']},"
+                f"{surrogate_stats['surrogate_trust_alpha_used']:.6f},"
+                f"{surrogate_stats['surrogate_trust_score']:.6f},"
+                f"{surrogate_stats['surrogate_trust_alpha_next']:.6f}\n"
+            )
     
     if args.track and jax.process_index() == 0:
         run.log(stats)
@@ -839,15 +802,15 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         for k in stats:
             print(f"\t{k}: {stats[k]}")
 
-    return noiser_params, params, true_train_fitness_sum
+    return noiser_params, params, true_train_fitness_sum, next_surrogate_trust_alpha
 
 with open(validation_csv_path, "w", encoding="utf-8") as f:
     f.write("epoch,validation_score,time_seconds\n")
-if args.eval_train_every is not None and args.eval_train_every > 0:
-    with open(metrics_csv_path, "w", encoding="utf-8") as f:
+if ADAPTIVE_SURROGATE_MODE:
+    with open(surrogate_csv_path, "w", encoding="utf-8") as f:
         f.write(
-            "epoch,time_seconds,train_phase,validation_score,train_eval_score,"
-            "active_pool_train_eval_score,batch_fitness,lora_update_rms,nonlora_update_rms,total_update_rms\n"
+            "epoch,rollout_members,surrogate_members,"
+            "trust_alpha_used,trust_score,trust_alpha_next\n"
         )
 if hellaswag_validate is not None:
     with open(hellaswag_csv_path, "w", encoding="utf-8") as f:
@@ -878,12 +841,9 @@ for epoch in tqdm.trange(args.num_epochs):
     if budget is not None and (time.time() - run_start_time) >= budget:
         print(f"Time budget ({budget}s) reached before epoch {epoch}. Stopping.")
         break
-    noiser_params, params, true_train_fitness_sum = single_epoch(
-        noiser_params, params, true_train_fitness_sum, epoch, time.time() - run_start_time
+    noiser_params, params, true_train_fitness_sum, surrogate_trust_alpha = single_epoch(
+        noiser_params, params, true_train_fitness_sum, epoch, surrogate_trust_alpha
     )
-    if _adaptive_stop_training:
-        print(f"Adaptive policy stop after epoch {epoch}.")
-        break
     budget = _effective_time_budget_seconds()
     if budget is not None and (time.time() - run_start_time) >= budget:
         print(f"Time budget ({budget}s) reached after epoch {epoch}. Stopping.")
