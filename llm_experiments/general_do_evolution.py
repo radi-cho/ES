@@ -20,6 +20,14 @@ from hyperscalees.models.llm.tokenizer import LegacyWorldTokenizer
 from hyperscalees.models.common import simple_es_tree_key
 
 from hyperscalees.noiser import all_noisers
+from hyperscalees.noiser.predictive_eggroll import (
+    OnlinePromptRidge,
+    audit_correct_pair_differences,
+    build_mutation_feature_fn,
+    pair_differences_to_member_utilities,
+    pair_ids_to_member_ids,
+    sample_stratified_audit_pairs,
+)
 from hyperscalees.environments.llm_bandits import all_tasks, validation_tasks
 
 import tyro
@@ -92,6 +100,20 @@ class Args:
 
     generations_per_prompt: int = 8
 
+    # Two-fidelity predictive EGGROLL.  The ordinary physical rollout batch is
+    # unchanged; only the virtual update population grows by this factor.
+    predictive_virtual_factor: int = 16
+    predictive_probes_per_matrix: int = 2
+    predictive_ridge: float = 32.0
+    predictive_replay_capacity: int = 64
+    predictive_min_observations: int = 16
+    predictive_prediction_clip: float = 1.0
+    predictive_initial_reward_scale: float = 0.5
+    predictive_reward_scale_decay: float = 0.9
+    predictive_minimum_reward_scale: float = 0.1
+    predictive_feature_seed: int = 0
+    predictive_use_predictions: bool = True
+
     train_dataset_size: Optional[int] = None
     val_dataset_size: Optional[int] = None
     time_budget_seconds: Optional[float] = None
@@ -159,6 +181,32 @@ print("local devices", jax.local_devices())
 print("process id", jax.process_index())
 args.proc_id = jax.process_index()
 args.total_parallel_generations = total_num_devices * args.parallel_generations_per_gpu
+if args.generations_per_prompt < 1:
+    raise ValueError("generations_per_prompt must be positive")
+if args.total_parallel_generations % args.generations_per_prompt:
+    raise ValueError("population must be divisible by generations_per_prompt")
+
+PREDICTIVE_MODE = args.noiser == "predictive_eggroll"
+if PREDICTIVE_MODE:
+    if args.generations_per_prompt < 2 or args.generations_per_prompt % 2:
+        raise ValueError(
+            "predictive_eggroll needs positive, even generations_per_prompt"
+        )
+    if total_num_devices != 1:
+        raise ValueError("predictive_eggroll currently supports one visible device")
+    if not args.freeze_nonlora:
+        raise ValueError("predictive_eggroll currently requires freeze_nonlora")
+    if args.predictive_virtual_factor < 1:
+        raise ValueError("predictive_virtual_factor must be positive")
+    args.virtual_generations_per_prompt = (
+        args.generations_per_prompt * args.predictive_virtual_factor
+    )
+    args.virtual_total_parallel_generations = (
+        args.total_parallel_generations * args.predictive_virtual_factor
+    )
+else:
+    args.virtual_generations_per_prompt = args.generations_per_prompt
+    args.virtual_total_parallel_generations = args.total_parallel_generations
 
 # args.lr = args.lr_scale * (args.sigma ** 2) * np.sqrt(args.total_parallel_generations)
 USE_SHARD_MAP = total_num_devices > 1
@@ -166,7 +214,14 @@ mesh = jax.make_mesh((len(jax.devices()),), ("data",)) if USE_SHARD_MAP else Non
 
 print()
 print("per-device generations is", args.parallel_generations_per_gpu)
-print("full number of generations is", args.total_parallel_generations)
+print("physical number of generations is", args.total_parallel_generations)
+if PREDICTIVE_MODE:
+    print(
+        "virtual number of generations is",
+        args.virtual_total_parallel_generations,
+        f"({args.virtual_generations_per_prompt} per prompt; "
+        f"1/{args.predictive_virtual_factor} fully evaluated)",
+    )
 
 RWKV, full_params, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
 legacy_tokenizer = LegacyWorldTokenizer() if args.model_choice[0] == "7" else tokenizer
@@ -414,12 +469,19 @@ def shard_on_data(x):
     return jax.sharding.reshard(arr, sharding)
 
 params = jax.tree.map(replicate_matrix, params)
-frozen_noiser_params, noiser_params = NOISER.init_noiser(params, args.sigma, args.lr_scale, group_size=args.generations_per_prompt, freeze_nonlora=args.freeze_nonlora, noise_reuse=args.noise_reuse)
+frozen_noiser_params, noiser_params = NOISER.init_noiser(
+    params,
+    args.sigma,
+    args.lr_scale,
+    group_size=args.virtual_generations_per_prompt,
+    freeze_nonlora=args.freeze_nonlora,
+    noise_reuse=args.noise_reuse,
+)
 base_evo_keys = simple_es_tree_key(params, base_model_key, scan_map)
 
 
 all_thread_idxes = shard_on_data(np.arange(args.total_parallel_generations))
-global_indices = all_thread_idxes
+global_indices = shard_on_data(np.arange(args.virtual_total_parallel_generations))
 
 _generate_thread = build_generate_thread(
     RWKV,
@@ -523,16 +585,63 @@ if USE_SHARD_MAP:
     ).lower(
         noiser_params,
         params,
-        shard_on_data(np.zeros(args.total_parallel_generations, dtype=np.float32)),
+        shard_on_data(
+            np.zeros(args.virtual_total_parallel_generations, dtype=np.float32)
+        ),
         0,
     ).compile()
 else:
     do_update = jax.jit(_do_update, donate_argnums=(0, 1)).lower(
-        noiser_params, params, jnp.zeros(args.total_parallel_generations, dtype=jnp.float32), 0
+        noiser_params,
+        params,
+        jnp.zeros(args.virtual_total_parallel_generations, dtype=jnp.float32),
+        0,
     ).compile()
 print("Compile time", time.time() - start_time)
 print("memory info")
 print(do_update.memory_analysis())
+
+predictive_feature_batch = None
+predictive_feature_info = None
+predictive_predictor = None
+virtual_pair_ids = None
+if PREDICTIVE_MODE:
+    feature_fn, predictive_feature_info = build_mutation_feature_fn(
+        params,
+        base_evo_keys,
+        es_map,
+        frozen_noiser_params,
+        probes_per_matrix=args.predictive_probes_per_matrix,
+        seed=args.predictive_feature_seed,
+    )
+    virtual_pair_ids = jnp.arange(
+        args.virtual_total_parallel_generations // 2, dtype=jnp.int32
+    )
+    print(
+        "Compiling predictive mutation features",
+        f"({predictive_feature_info.matrix_count} matrices, "
+        f"{predictive_feature_info.feature_dim} features)",
+    )
+    start_time = time.time()
+    predictive_feature_batch = jax.jit(feature_fn).lower(
+        params,
+        jax.ShapeDtypeStruct(virtual_pair_ids.shape, jnp.dtype("int32")),
+        0,
+    ).compile()
+    print("Compile time", time.time() - start_time)
+    print("memory info")
+    print(predictive_feature_batch.memory_analysis())
+    predictive_predictor = OnlinePromptRidge(
+        num_prompts=len(Task),
+        feature_dim=predictive_feature_info.feature_dim,
+        ridge=args.predictive_ridge,
+        min_observations=args.predictive_min_observations,
+        prediction_clip=args.predictive_prediction_clip,
+        initial_reward_scale=args.predictive_initial_reward_scale,
+        reward_scale_decay=args.predictive_reward_scale_decay,
+        minimum_reward_scale=args.predictive_minimum_reward_scale,
+        replay_capacity=args.predictive_replay_capacity,
+    )
 
 true_train_fitness_sum = 0.0
 
@@ -540,6 +649,8 @@ FULL = 0
 LORA = 1
 
 full_name = f"{args.task}_{args.noiser}_{args.wandb_name}_lr={args.lr_scale}_sigma={args.sigma:.2e}_bs={args.total_parallel_generations}"
+if PREDICTIVE_MODE:
+    full_name += f"_virtual={args.virtual_total_parallel_generations}"
 if args.train_dataset_size is not None:
     full_name += f"_trainD={args.train_dataset_size}"
 experiment_id = f"{full_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -680,11 +791,54 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         batch_prompts = jnp.repeat(unique_prompts, args.generations_per_prompt, axis=0)
     prompt_processing_time = time.time() - start_time
 
+    predictive_stats = {}
+    pair_features = None
+    virtual_pair_prompt_ids = None
+    predicted_pair_differences = None
+    audited_pair_ids = None
+    selected_member_ids = None
+    feature_time = 0.0
+    if PREDICTIVE_MODE:
+        start_time = time.time()
+        pair_features = np.asarray(
+            jax.device_get(
+                predictive_feature_batch(params, virtual_pair_ids, epoch)
+            ),
+            dtype=np.float32,
+        )
+        virtual_pairs_per_prompt = args.virtual_generations_per_prompt // 2
+        virtual_pair_prompt_ids = np.repeat(
+            np.asarray(train_indices, dtype=np.int32), virtual_pairs_per_prompt
+        )
+        predicted_pair_differences = predictive_predictor.predict(
+            pair_features, virtual_pair_prompt_ids
+        )
+        if not args.predictive_use_predictions:
+            predicted_pair_differences = np.zeros_like(
+                predicted_pair_differences
+            )
+        audited_pair_ids = sample_stratified_audit_pairs(
+            num_prompts=args.prompts_per_epoch,
+            physical_members_per_prompt=args.generations_per_prompt,
+            virtual_factor=args.predictive_virtual_factor,
+            seed=args.seed,
+            epoch=epoch,
+        )
+        selected_member_ids = pair_ids_to_member_ids(audited_pair_ids)
+        feature_time = time.time() - start_time
+
     # print("CURRENT MEMORY start of batch", jax.local_devices()[0].memory_stats())
     start_time = time.time()
     if epoch == 0:
         print("generating batch")
-    thread_idxes = all_thread_idxes if USE_SHARD_MAP else jnp.arange(args.total_parallel_generations, dtype=jnp.int32)
+    if PREDICTIVE_MODE:
+        thread_idxes = jnp.asarray(selected_member_ids, dtype=jnp.int32)
+    else:
+        thread_idxes = (
+            all_thread_idxes
+            if USE_SHARD_MAP
+            else jnp.arange(args.total_parallel_generations, dtype=jnp.int32)
+        )
     output_batch = jax.block_until_ready(
         generate_batch(noiser_params, params, batch_prompts, thread_idxes, epoch)
     )
@@ -710,7 +864,8 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         for i in range(local_gen.shape[0]):
             prompt_txt = safe_decode(local_prompts[i], tokenizer)
             gen_txt = safe_decode(local_gen[i], tokenizer)
-            rows.append([epoch, i, prompt_txt, gen_txt])
+            member_id = int(selected_member_ids[i]) if PREDICTIVE_MODE else i
+            rows.append([epoch, member_id, prompt_txt, gen_txt])
 
         table = wandb.Table(columns=["epoch", "sample_id", "prompt", "generation"], rows=rows)
         wandb.log({"text_samples": table}, step=epoch)
@@ -759,12 +914,77 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         output_scores = jax.sharding.reshard(output_scores, NamedSharding(mesh, P("data")))
     gather_time = time.time() - start_time
 
+    update_scores = output_scores
+    observed_pair_differences = None
+    if PREDICTIVE_MODE:
+        observed_scores_np = np.asarray(jax.device_get(output_scores), dtype=np.float32)
+        frozen_reward_scale = predictive_predictor.reward_scale
+        corrected_pair_differences, observed_pair_differences = (
+            audit_correct_pair_differences(
+                predicted_pair_differences,
+                audited_pair_ids,
+                observed_scores_np,
+                virtual_factor=args.predictive_virtual_factor,
+            )
+        )
+        update_scores = jnp.asarray(
+            pair_differences_to_member_utilities(
+                corrected_pair_differences,
+                physical_population=args.total_parallel_generations,
+                virtual_population=args.virtual_total_parallel_generations,
+                reward_scale=frozen_reward_scale,
+            )
+        )
+        audited_predictions = predicted_pair_differences[audited_pair_ids]
+        audit_mse = float(
+            np.mean((audited_predictions - observed_pair_differences) ** 2)
+        )
+        zero_mse = float(np.mean(observed_pair_differences**2))
+        if (
+            observed_pair_differences.size > 1
+            and np.std(audited_predictions) > 1e-8
+            and np.std(observed_pair_differences) > 1e-8
+        ):
+            audit_correlation = float(
+                np.corrcoef(audited_predictions, observed_pair_differences)[0, 1]
+            )
+        else:
+            audit_correlation = 0.0
+        predictive_stats = {
+            "physical_population": args.total_parallel_generations,
+            "virtual_population": args.virtual_total_parallel_generations,
+            "audit_fraction": 1.0 / args.predictive_virtual_factor,
+            "predictor_feature_time": feature_time,
+            "predictor_observations": predictive_predictor.total_observations,
+            "predictor_reward_scale": frozen_reward_scale,
+            "predictor_prediction_rms": float(
+                np.sqrt(np.mean(predicted_pair_differences**2))
+            ),
+            "predictor_audit_mse": audit_mse,
+            "predictor_zero_mse": zero_mse,
+            "predictor_residual_ratio": audit_mse / max(zero_mse, 1e-8),
+            "predictor_audit_correlation": audit_correlation,
+            "corrected_pair_rms": float(
+                np.sqrt(np.mean(corrected_pair_differences**2))
+            ),
+        }
 
     start_time = time.time()
     if epoch == 0:
         print("updating params")
-    noiser_params, params, parameter_differences = jax.block_until_ready(do_update(noiser_params, params, output_scores, epoch))
+    noiser_params, params, parameter_differences = jax.block_until_ready(
+        do_update(noiser_params, params, update_scores, epoch)
+    )
     parameter_update_time = time.time() - start_time
+    if PREDICTIVE_MODE:
+        # Predictions used above were frozen before this generation's labels
+        # were observed.  Labels become available only for the next epoch.
+        predictive_predictor.update(
+            pair_features[audited_pair_ids],
+            virtual_pair_prompt_ids[audited_pair_ids],
+            observed_pair_differences,
+        )
+        predictive_predictor.update_reward_scale(observed_scores_np)
 
     # print("CURRENT MEMORY start of stats", jax.local_devices()[0].memory_stats())
     # parameter_differences = jax.tree.map(lambda x, y:jnp.mean(jnp.abs(x-y)), params, updated_params)
@@ -795,6 +1015,7 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, elapsed_s
         "update_time": parameter_update_time,
         "true_train_avg_fitness": true_train_fitness_sum / ((epoch + 1) * args.total_parallel_generations)
     }
+    stats.update(predictive_stats)
 
     if validation_score is not None:
         stats["validation_score"] = validation_score
