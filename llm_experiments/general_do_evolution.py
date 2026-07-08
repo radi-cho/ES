@@ -19,17 +19,13 @@ from hyperscalees.models.llm.tokenizer import LegacyWorldTokenizer
 from hyperscalees.models.common import simple_es_tree_key
 
 from hyperscalees.noiser import all_noisers
-from hyperscalees.noiser.adaptive_surrogate_eggroll import (
-    assemble_member_fitness,
-    compute_trust_score,
-    observed_member_fitness_to_pair_differences,
-    pair_differences_to_member_fitness,
-    pair_ids_to_member_ids,
-    sample_surrogate_pair_mask,
-)
 from hyperscalees.noiser.predictive_eggroll import (
-    OnlinePromptRidge,
-    build_mutation_feature_fn,
+    OnlineRidgeSurrogate,
+    audit_correct_pair_differences,
+    make_countsketch,
+    pair_differences_to_member_utilities,
+    pair_ids_to_member_ids,
+    sample_stratified_audit_pairs,
 )
 from hyperscalees.environments.llm_bandits import all_tasks, validation_tasks
 
@@ -48,7 +44,8 @@ from hydra import initialize, compose, initialize_config_dir
 from hydra.utils import instantiate
 
 from .utils import (
-    build_generate_thread, 
+    build_generate_thread,
+    build_preview_pair_thread,
     build_validate,
     build_hellaswag_validate,
     safe_decode
@@ -101,15 +98,23 @@ class Args:
 
     generations_per_prompt: int = 8
 
-    # Adaptive surrogate fitness for physical EGGROLL rollouts.
-    surrogate_probes_per_matrix: int = 2
-    surrogate_ridge: float = 16.0
-    surrogate_replay_capacity: int = 64
-    surrogate_min_observations: int = 4
-    surrogate_prediction_clip: float = 1.0
-    surrogate_feature_seed: int = 0
-    surrogate_max_fraction: float = 0.8
-    surrogate_global_fallback: bool = True
+    # Prompt-preview surrogate for a larger virtual EGGROLL population.
+    predictive_virtual_factor: int = 16
+    predictive_preview_microbatch_pairs: int = 8
+    predictive_sketch_size: int = 128
+    predictive_ridge: float = 10.0
+    predictive_decay: float = 0.99
+    predictive_min_observations: int = 256
+    predictive_prediction_clip: float = 1.1
+    predictive_reward_scale: float = 0.5
+    predictive_reward_scale_decay: float = 0.9
+    predictive_minimum_reward_scale: float = 0.1
+    predictive_feature_seed: int = 0
+    predictive_audit_seed: int = 1
+    predictive_rms_floor: float = 1e-4
+    predictive_use_predictions: bool = True
+    predictive_max_residual_ratio: float = 0.9
+    predictive_min_quality_nonzero_labels: int = 4
 
     train_dataset_size: Optional[int] = None
     val_dataset_size: Optional[int] = None
@@ -177,26 +182,61 @@ mesh = jax.make_mesh((len(jax.devices()),), ("data",)) if USE_SHARD_MAP else Non
 
 print()
 print("per-device generations is", args.parallel_generations_per_gpu)
-print("full number of generations is", args.total_parallel_generations)
+print("physical number of generations is", args.total_parallel_generations)
 
+if args.generations_per_prompt < 1:
+    raise ValueError("generations_per_prompt must be positive")
+if args.total_parallel_generations % args.generations_per_prompt:
+    raise ValueError("physical population must divide evenly into prompt groups")
 args.prompts_per_epoch = args.total_parallel_generations // args.generations_per_prompt
 
-ADAPTIVE_SURROGATE_MODE = args.noiser == "adaptive_surrogate_eggroll"
-if ADAPTIVE_SURROGATE_MODE:
+PREDICTIVE_MODE = args.noiser == "predictive_eggroll"
+if PREDICTIVE_MODE:
     if args.generations_per_prompt < 2 or args.generations_per_prompt % 2:
         raise ValueError(
-            "adaptive_surrogate_eggroll needs positive, even generations_per_prompt"
+            "predictive_eggroll needs positive, even generations_per_prompt"
         )
     if total_num_devices != 1:
-        raise ValueError(
-            "adaptive_surrogate_eggroll currently supports one visible device"
-        )
+        raise ValueError("predictive_eggroll currently supports one visible device")
     if not args.freeze_nonlora:
-        raise ValueError(
-            "adaptive_surrogate_eggroll currently requires freeze_nonlora"
-        )
-    args.pairs_per_prompt = args.generations_per_prompt // 2
-    args.total_pairs = args.prompts_per_epoch * args.pairs_per_prompt
+        raise ValueError("predictive_eggroll currently requires freeze_nonlora")
+    if args.predictive_virtual_factor < 1:
+        raise ValueError("predictive_virtual_factor must be positive")
+    if args.predictive_preview_microbatch_pairs < 1:
+        raise ValueError("predictive_preview_microbatch_pairs must be positive")
+    if args.sigma <= 0.0:
+        raise ValueError("predictive_eggroll requires sigma > 0")
+    if args.predictive_reward_scale <= 0.0:
+        raise ValueError("predictive_reward_scale must be positive")
+    if not 0.0 <= args.predictive_reward_scale_decay <= 1.0:
+        raise ValueError("predictive_reward_scale_decay must be in [0, 1]")
+    if args.predictive_minimum_reward_scale <= 0.0:
+        raise ValueError("predictive_minimum_reward_scale must be positive")
+    if args.predictive_sketch_size < 1:
+        raise ValueError("predictive_sketch_size must be positive")
+    if args.predictive_max_residual_ratio <= 0.0:
+        raise ValueError("predictive_max_residual_ratio must be positive")
+    if args.predictive_min_quality_nonzero_labels < 1:
+        raise ValueError("predictive_min_quality_nonzero_labels must be positive")
+    args.virtual_generations_per_prompt = (
+        args.generations_per_prompt * args.predictive_virtual_factor
+    )
+    args.virtual_total_parallel_generations = (
+        args.total_parallel_generations * args.predictive_virtual_factor
+    )
+    if args.temperature != 0.0:
+        print("WARNING: stochastic rollout noise is not represented by prompt previews")
+else:
+    args.virtual_generations_per_prompt = args.generations_per_prompt
+    args.virtual_total_parallel_generations = args.total_parallel_generations
+
+if PREDICTIVE_MODE:
+    print(
+        "virtual number of generations is",
+        args.virtual_total_parallel_generations,
+        f"({args.virtual_generations_per_prompt} per prompt; "
+        f"1/{args.predictive_virtual_factor} fully evaluated)",
+    )
 
 RWKV, full_params, tokenizer = get_model(args.model_choice, rwkv_type=args.rwkv_type, verbose=True, dtype=args.dtype)
 legacy_tokenizer = LegacyWorldTokenizer() if args.model_choice[0] == "7" else tokenizer
@@ -263,12 +303,19 @@ def shard_on_data(x):
     return jax.sharding.reshard(arr, sharding)
 
 params = jax.tree.map(replicate_matrix, params)
-frozen_noiser_params, noiser_params = NOISER.init_noiser(params, args.sigma, args.lr_scale, group_size=args.generations_per_prompt, freeze_nonlora=args.freeze_nonlora, noise_reuse=args.noise_reuse)
+frozen_noiser_params, noiser_params = NOISER.init_noiser(
+    params,
+    args.sigma,
+    args.lr_scale,
+    group_size=args.virtual_generations_per_prompt,
+    freeze_nonlora=args.freeze_nonlora,
+    noise_reuse=args.noise_reuse,
+)
 base_evo_keys = simple_es_tree_key(params, base_model_key, scan_map)
 
 
-all_thread_idxes = shard_on_data(np.arange(args.total_parallel_generations))
-global_indices = all_thread_idxes
+physical_thread_idxes = shard_on_data(np.arange(args.total_parallel_generations))
+global_indices = shard_on_data(np.arange(args.virtual_total_parallel_generations))
 
 _generate_thread = build_generate_thread(
     RWKV,
@@ -295,8 +342,13 @@ if USE_SHARD_MAP:
     ).lower(
         noiser_params,
         params,
-        shard_on_data(np.zeros((args.total_parallel_generations, args.generation_length), dtype=np.int32)),
-        all_thread_idxes,
+        shard_on_data(
+            np.zeros(
+                (args.total_parallel_generations, args.generation_length),
+                dtype=np.int32,
+            )
+        ),
+        physical_thread_idxes,
         0,
     ).compile()
 else:
@@ -306,7 +358,8 @@ else:
         noiser_params,
         params,
         jax.ShapeDtypeStruct(
-            (args.total_parallel_generations, args.generation_length), jnp.dtype("int32")
+            (args.total_parallel_generations, args.generation_length),
+            jnp.dtype("int32"),
         ),
         jnp.arange(args.total_parallel_generations, dtype=jnp.int32),
         0,
@@ -314,12 +367,6 @@ else:
 print("Compile time", time.time() - start_time)
 print("memory info")
 print(generate_batch.memory_analysis())
-
-generate_subset = None
-if ADAPTIVE_SURROGATE_MODE:
-    generate_subset = jax.jit(
-        jax.vmap(_generate_thread, in_axes=(None, None, 0, 0, None))
-    )
 
 validate = build_validate(RWKV, config, params, base_evo_keys, base_valid_key, tokenizer, legacy_tokenizer, args, args.temperature, suppress_eos_token=suppress_eos_token)
 
@@ -363,66 +410,143 @@ if USE_SHARD_MAP:
     ).lower(
         noiser_params,
         params,
-        shard_on_data(np.zeros(args.total_parallel_generations, dtype=np.float32)),
+        shard_on_data(
+            np.zeros(args.virtual_total_parallel_generations, dtype=np.float32)
+        ),
         0,
     ).compile()
 else:
     do_update = jax.jit(_do_update, donate_argnums=(0, 1)).lower(
-        noiser_params, params, jnp.zeros(args.total_parallel_generations, dtype=jnp.float32), 0
+        noiser_params,
+        params,
+        jnp.zeros(args.virtual_total_parallel_generations, dtype=jnp.float32),
+        0,
     ).compile()
 print("Compile time", time.time() - start_time)
 print("memory info")
 print(do_update.memory_analysis())
 
-surrogate_feature_batch = None
-surrogate_feature_info = None
-surrogate_predictor = None
-surrogate_trust_alpha = 0.0
-if ADAPTIVE_SURROGATE_MODE:
-    feature_fn, surrogate_feature_info = build_mutation_feature_fn(
-        params,
-        base_evo_keys,
-        es_map,
-        frozen_noiser_params,
-        probes_per_matrix=args.surrogate_probes_per_matrix,
-        seed=args.surrogate_feature_seed,
+predictive_predictor = None
+preview_feature_batch = None
+preview_prompt_width = None
+preview_layers = None
+countsketch_buckets = None
+countsketch_signs = None
+
+
+def _zero_padded_prompt_lengths(prompts: np.ndarray) -> np.ndarray:
+    """Return the last nonzero token position plus one for each prompt."""
+
+    nonzero = np.asarray(prompts) != 0
+    has_token = np.any(nonzero, axis=1)
+    last_from_end = np.argmax(nonzero[:, ::-1], axis=1)
+    return np.where(has_token, prompts.shape[1] - last_from_end, 0).astype(np.int32)
+
+
+if PREDICTIVE_MODE:
+    if RWKV.__name__ != "Qwen35RWKV" or "layer_types" not in config:
+        raise ValueError("predictive_eggroll requires the instrumented Qwen35 model")
+    num_layers = len(config["layer_types"])
+    late_layer = min(num_layers - 1, int(np.floor(0.75 * num_layers)))
+    preview_layers = (late_layer, num_layers - 1)
+    if len(set(preview_layers)) != 2:
+        raise ValueError("predictive_eggroll requires at least two distinct layers")
+
+    task_prompts = np.asarray(
+        Task.get_input(jnp.arange(len(Task), dtype=jnp.int32)), dtype=np.int32
     )
-    physical_pair_ids = jnp.arange(args.total_pairs, dtype=jnp.int32)
+    task_prompt_lengths = _zero_padded_prompt_lengths(task_prompts)
+    if not np.all(task_prompt_lengths > 0):
+        raise ValueError("predictive_eggroll requires nonempty, zero-padded prompts")
+    if any(
+        np.any(prompt[:length] == 0)
+        for prompt, length in zip(task_prompts, task_prompt_lengths)
+    ):
+        raise ValueError(
+            "predictive_eggroll requires token 0 to occur only in prompt padding"
+        )
+    preview_prompt_width = int(task_prompt_lengths.max())
+
+    countsketch_buckets, countsketch_signs = make_countsketch(
+        num_layers=2,
+        hidden_size=int(config["hidden_size"]),
+        sketch_size=args.predictive_sketch_size,
+        seed=args.predictive_feature_seed,
+    )
+    feature_dim = 2 * args.predictive_sketch_size
+    predictive_predictor = OnlineRidgeSurrogate(
+        feature_dim=feature_dim,
+        ridge=args.predictive_ridge,
+        decay=args.predictive_decay,
+        min_observations=args.predictive_min_observations,
+        prediction_clip=args.predictive_prediction_clip,
+        rms_floor=args.predictive_rms_floor,
+        initial_reward_scale=args.predictive_reward_scale,
+        reward_scale_decay=args.predictive_reward_scale_decay,
+        minimum_reward_scale=args.predictive_minimum_reward_scale,
+    )
+
+    preview_pair = build_preview_pair_thread(
+        RWKV,
+        NOISER,
+        frozen_noiser_params,
+        config,
+        base_evo_keys,
+        preview_layers,
+        preview_prompt_width,
+        countsketch_buckets,
+        countsketch_signs,
+        num_buckets=args.predictive_sketch_size,
+        center_rms_floor=args.predictive_rms_floor,
+    )
     print(
-        "Compiling surrogate mutation features",
-        f"({surrogate_feature_info.matrix_count} matrices, "
-        f"{surrogate_feature_info.feature_dim} features)",
+        "Compiling hidden-only preview batch:",
+        f"pairs={args.predictive_preview_microbatch_pairs},",
+        f"prompt_width={preview_prompt_width}, layers={preview_layers},",
+        f"features={feature_dim}",
     )
     start_time = time.time()
-    surrogate_feature_batch = jax.jit(feature_fn).lower(
+    preview_feature_batch = jax.jit(
+        jax.vmap(preview_pair, in_axes=(None, None, 0, 0, 0, None))
+    ).lower(
+        noiser_params,
         params,
-        jax.ShapeDtypeStruct(physical_pair_ids.shape, jnp.dtype("int32")),
+        jax.ShapeDtypeStruct(
+            (args.predictive_preview_microbatch_pairs, preview_prompt_width),
+            jnp.dtype("int32"),
+        ),
+        jax.ShapeDtypeStruct(
+            (args.predictive_preview_microbatch_pairs,), jnp.dtype("int32")
+        ),
+        jax.ShapeDtypeStruct(
+            (args.predictive_preview_microbatch_pairs,), jnp.dtype("int32")
+        ),
         0,
     ).compile()
     print("Compile time", time.time() - start_time)
     print("memory info")
-    print(surrogate_feature_batch.memory_analysis())
-    surrogate_predictor = OnlinePromptRidge(
-        num_prompts=len(Task),
-        feature_dim=surrogate_feature_info.feature_dim,
-        ridge=args.surrogate_ridge,
-        min_observations=args.surrogate_min_observations,
-        prediction_clip=args.surrogate_prediction_clip,
-        global_fallback=args.surrogate_global_fallback,
-        replay_capacity=args.surrogate_replay_capacity,
-    )
+    print(preview_feature_batch.memory_analysis())
+
     print(
-        "Adaptive surrogate fitness enabled:",
-        f"max_fraction={args.surrogate_max_fraction},",
-        f"trust_score=corr(pred, rollout) from previous epoch",
+        "Predictive EGGROLL enabled:",
+        f"physical={args.total_parallel_generations},",
+        f"virtual={args.virtual_total_parallel_generations},",
+        f"audit_probability={1.0 / args.predictive_virtual_factor:.4f},",
+        f"audit_seed={args.predictive_audit_seed},",
+        f"feature_seed={args.predictive_feature_seed},",
+        f"initial_reward_scale={args.predictive_reward_scale},",
+        f"warmup_labels={args.predictive_min_observations}",
     )
 
 true_train_fitness_sum = 0.0
+predictor_quality_passed = False
 
 FULL = 0
 LORA = 1
 
 full_name = f"{args.task}_{args.noiser}_{args.wandb_name}_lr={args.lr_scale}_sigma={args.sigma:.2e}_bs={args.total_parallel_generations}"
+if PREDICTIVE_MODE:
+    full_name += f"_virtual={args.virtual_total_parallel_generations}"
 if args.train_dataset_size is not None:
     full_name += f"_trainD={args.train_dataset_size}"
 experiment_id = f"{full_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -433,7 +557,7 @@ run_out_dir.mkdir(parents=True, exist_ok=True)
 
 fitness_csv_path = run_out_dir / "fitness.csv"
 validation_csv_path = run_out_dir / "validation.csv"
-surrogate_csv_path = run_out_dir / "surrogate_mix.csv"
+predictive_csv_path = run_out_dir / "predictive_surrogate.csv"
 hellaswag_csv_path = run_out_dir / "hellaswag_validation.csv"
 figure_4b_path = run_out_dir / "figure_4b.png"
 
@@ -462,11 +586,63 @@ def _epoch_train_indices(epoch: int) -> np.ndarray:
     return np.arange(start, start + args.prompts_per_epoch, dtype=np.int32)
 
 
-def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, surrogate_trust_alpha):
+def _maybe_log_outputs(epoch, output_batch, prompt_batch, sample_ids=None):
+    if not (
+        args.track
+        and args.log_output_every > 0
+        and epoch % args.log_output_every == 0
+        and jax.process_index() == 0
+    ):
+        return
+    sample_count = min(8, args.total_parallel_generations)
+    if USE_SHARD_MAP:
+        local_gen = np.asarray(output_batch.addressable_shards[0].data)[:sample_count]
+        local_prompts = np.asarray(prompt_batch.addressable_shards[0].data)[:sample_count]
+    else:
+        local_gen = np.asarray(output_batch)[:sample_count]
+        local_prompts = np.asarray(prompt_batch)[:sample_count]
+    local_ids = (
+        np.arange(local_gen.shape[0], dtype=np.int32)
+        if sample_ids is None
+        else np.asarray(sample_ids)[: local_gen.shape[0]]
+    )
+    rows = [
+        [
+            epoch,
+            int(local_ids[i]),
+            safe_decode(local_prompts[i], tokenizer),
+            safe_decode(local_gen[i], tokenizer),
+        ]
+        for i in range(local_gen.shape[0])
+    ]
+    wandb.log(
+        {"text_samples": wandb.Table(
+            columns=["epoch", "sample_id", "prompt", "generation"], rows=rows
+        )},
+        step=epoch,
+    )
+    epoch_dir = run_out_dir / f"epoch_{epoch:05d}"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    with open(
+        epoch_dir / f"outputs_rank{args.proc_id}.csv",
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "global_idx", "prompt", "generation"])
+        writer.writerows(rows)
+
+
+def single_epoch(
+    noiser_params,
+    params,
+    true_train_fitness_sum,
+    epoch,
+    predictor_quality_passed,
+):
     validation_score = None
     hellaswag_score = None
-    next_surrogate_trust_alpha = surrogate_trust_alpha
-    surrogate_stats = {}
     if epoch % args.validate_every == 0:
         print("VALIDATION")
         validation_score = validate(params, epoch)
@@ -475,298 +651,346 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, surrogate
             print("HELLASWAG VALIDATION")
             hellaswag_score = hellaswag_validate(params, epoch)
             print("HELLASWAG SCORE=", hellaswag_score)
-    # print("CURRENT MEMORY start of epoch", jax.local_devices()[0].memory_stats())
+
     start_time = time.time()
     train_indices = _epoch_train_indices(epoch)
     if args.random_train_prompts and epoch % args.validate_every == 0:
         print(f"Epoch {epoch} train indices: {train_indices.tolist()}")
-    if USE_SHARD_MAP:
-        unique_indices = jax.device_put(
-            replicate_matrix(jnp.asarray(train_indices, dtype=jnp.int32)),
-            NamedSharding(mesh, P("data")),
-        )
-        indices = jnp.repeat(unique_indices, args.generations_per_prompt, axis=0)
-        unique_prompts_np = np.asarray(Task.get_input(jnp.asarray(train_indices, dtype=jnp.int32)))
-        batch_prompts = shard_on_data(
-            np.repeat(unique_prompts_np, args.generations_per_prompt, axis=0)
-        )
-    else:
-        unique_indices = jnp.asarray(train_indices, dtype=jnp.int32)
-        indices = jnp.repeat(unique_indices, args.generations_per_prompt, axis=0)
-        unique_prompts = Task.get_input(unique_indices)
-        batch_prompts = jnp.repeat(unique_prompts, args.generations_per_prompt, axis=0)
+    unique_prompts_np = np.asarray(
+        Task.get_input(jnp.asarray(train_indices, dtype=jnp.int32)), dtype=np.int32
+    )
     prompt_processing_time = time.time() - start_time
 
-    surrogate_stats = {}
-    pair_features = None
-    pair_prompt_ids = None
-    predicted_pair_differences = None
-    surrogate_pair_mask = None
-    rollout_pair_ids = None
-    feature_time = 0.0
-    if ADAPTIVE_SURROGATE_MODE:
+    preview_time = 0.0
+    prediction_time = 0.0
+    gather_time = 0.0
+    predictive_stats = {}
+
+    if PREDICTIVE_MODE:
+        virtual_pairs_per_prompt = args.virtual_generations_per_prompt // 2
+        total_virtual_pairs = args.virtual_total_parallel_generations // 2
+        audit_probability = 1.0 / args.predictive_virtual_factor
+        frozen_reward_scale = predictive_predictor.reward_scale
+
+        # Selection happens before either kernel and never depends on predictions.
+        audited_pair_ids = sample_stratified_audit_pairs(
+            num_prompts=args.prompts_per_epoch,
+            physical_members_per_prompt=args.generations_per_prompt,
+            virtual_factor=args.predictive_virtual_factor,
+            seed=args.predictive_audit_seed,
+            epoch=epoch,
+        )
+        audited_member_ids = pair_ids_to_member_ids(audited_pair_ids)
+        audited_pair_prompt_slots = audited_pair_ids // virtual_pairs_per_prompt
+        audited_member_prompt_slots = np.repeat(audited_pair_prompt_slots, 2)
+        audited_prompts = unique_prompts_np[audited_member_prompt_slots]
+        unique_prompt_lengths = _zero_padded_prompt_lengths(unique_prompts_np)
+        if np.any(unique_prompt_lengths > preview_prompt_width):
+            raise ValueError("encountered a prompt longer than the compiled preview width")
+        audited_dataset_indices = np.asarray(train_indices, dtype=np.int32)[
+            audited_member_prompt_slots
+        ]
+
+        if epoch == 0:
+            print("generating audited full rollouts")
         start_time = time.time()
-        physical_pair_ids = jnp.arange(args.total_pairs, dtype=jnp.int32)
-        pair_features = np.asarray(
-            jax.device_get(
-                surrogate_feature_batch(params, physical_pair_ids, epoch)
+        output_batch = jax.block_until_ready(
+            generate_batch(
+                noiser_params,
+                params,
+                jnp.asarray(audited_prompts),
+                jnp.asarray(audited_member_ids),
+                epoch,
+            )
+        )
+        token_generation_time = time.time() - start_time
+        _maybe_log_outputs(
+            epoch, output_batch, audited_prompts, audited_member_ids
+        )
+
+        start_time = time.time()
+        observed_scores = np.asarray(
+            Task.get_batch_fitness(
+                jax.device_put(
+                    audited_dataset_indices, jax.local_devices(backend="cpu")[0]
+                ),
+                jax.device_put(
+                    output_batch, jax.local_devices(backend="cpu")[0]
+                ),
             ),
             dtype=np.float32,
         )
-        pair_prompt_ids = np.repeat(
-            np.asarray(train_indices, dtype=np.int32), args.pairs_per_prompt
-        )
-        predicted_pair_differences = surrogate_predictor.predict(
-            pair_features, pair_prompt_ids
-        )
-        surrogate_fraction = min(
-            float(surrogate_trust_alpha), float(args.surrogate_max_fraction)
-        )
-        surrogate_pair_mask = sample_surrogate_pair_mask(
-            num_prompts=args.prompts_per_epoch,
-            pairs_per_prompt=args.pairs_per_prompt,
-            surrogate_fraction=surrogate_fraction,
-            seed=args.seed,
-            epoch=epoch,
-        )
-        rollout_pair_ids = np.flatnonzero(~surrogate_pair_mask).astype(np.int32)
-        feature_time = time.time() - start_time
+        fitness_time = time.time() - start_time
 
-    # print("CURRENT MEMORY start of batch", jax.local_devices()[0].memory_stats())
-    start_time = time.time()
-    if epoch == 0:
-        print("generating batch")
-    if ADAPTIVE_SURROGATE_MODE:
-        rollout_member_ids = pair_ids_to_member_ids(rollout_pair_ids)
-        if rollout_member_ids.size:
-            if USE_SHARD_MAP:
-                rollout_prompts = shard_on_data(
-                    np.asarray(batch_prompts)[rollout_member_ids]
-                )
-                rollout_indices = jnp.asarray(indices)[rollout_member_ids]
-                rollout_thread_idxes = jnp.asarray(rollout_member_ids, dtype=jnp.int32)
-                output_rollout = jax.block_until_ready(
-                    generate_subset(
-                        noiser_params,
-                        params,
-                        rollout_prompts,
-                        rollout_thread_idxes,
-                        epoch,
-                    )
-                )
-                _local_fitness = [
-                    jax.device_put(
-                        Task.get_batch_fitness(
-                            jax.device_put(
-                                rollout_indices.addressable_shards[i].data,
-                                jax.local_devices(backend="cpu")[0],
-                            ),
-                            jax.device_put(
-                                output_rollout.addressable_shards[i].data,
-                                jax.local_devices(backend="cpu")[0],
-                            ),
-                        ),
-                        rollout_indices.addressable_shards[i].device,
-                    )
-                    for i in range(len(rollout_indices.addressable_shards))
-                ]
-                rollout_scores = np.concatenate(
-                    [np.asarray(x) for x in _local_fitness], axis=0
-                ).astype(np.float32)
-            else:
-                rollout_prompts = jnp.asarray(batch_prompts)[jnp.asarray(rollout_member_ids)]
-                rollout_indices = indices[jnp.asarray(rollout_member_ids)]
-                rollout_thread_idxes = jnp.asarray(rollout_member_ids, dtype=jnp.int32)
-                output_rollout = jax.block_until_ready(
-                    generate_subset(
-                        noiser_params,
-                        params,
-                        rollout_prompts,
-                        rollout_thread_idxes,
-                        epoch,
-                    )
-                )
-                idx_cpu = jax.device_put(
-                    rollout_indices, jax.local_devices(backend="cpu")[0]
-                )
-                out_cpu = jax.device_put(
-                    output_rollout, jax.local_devices(backend="cpu")[0]
-                )
-                rollout_scores = np.asarray(
-                    Task.get_batch_fitness(idx_cpu, out_cpu), dtype=np.float32
-                )
-        else:
-            rollout_member_ids = np.asarray([], dtype=np.int32)
-            rollout_scores = np.asarray([], dtype=np.float32)
-        predicted_member_fitness = pair_differences_to_member_fitness(
-            predicted_pair_differences
+        start_time = time.time()
+        pair_features = np.empty(
+            (total_virtual_pairs, 2 * args.predictive_sketch_size),
+            dtype=np.float32,
         )
-        output_scores_np, rollout_pair_count, surrogate_pair_count = (
-            assemble_member_fitness(
-                total_members=args.total_parallel_generations,
-                predicted_member_fitness=predicted_member_fitness,
-                rollout_member_fitness=rollout_scores,
-                rollout_member_ids=rollout_member_ids,
-                surrogate_pair_mask=surrogate_pair_mask,
+        # Every pair uses this exact same feature kernel.  In particular, the
+        # feature/prediction cannot reveal whether a pair was selected for the
+        # audit, which is required by the HT unbiasedness argument.
+        preview_pair_ids = np.arange(total_virtual_pairs, dtype=np.int32)
+        microbatch = args.predictive_preview_microbatch_pairs
+        for offset in range(0, preview_pair_ids.size, microbatch):
+            pair_ids = preview_pair_ids[offset : offset + microbatch]
+            valid_count = pair_ids.size
+            if valid_count < microbatch:
+                pair_ids = np.pad(pair_ids, (0, microbatch - valid_count), mode="edge")
+            prompt_slots = pair_ids // virtual_pairs_per_prompt
+            preview_prompts = unique_prompts_np[
+                prompt_slots, :preview_prompt_width
+            ]
+            features = jax.block_until_ready(
+                preview_feature_batch(
+                    noiser_params,
+                    params,
+                    jnp.asarray(preview_prompts),
+                    jnp.asarray(unique_prompt_lengths[prompt_slots]),
+                    jnp.asarray(pair_ids),
+                    epoch,
+                )
+            )
+            pair_features[pair_ids[:valid_count]] = np.asarray(
+                features[:valid_count], dtype=np.float32
+            )
+        preview_time = time.time() - start_time
+
+        start_time = time.time()
+        predictor_ready_current = predictive_predictor.ready
+        candidate_pair_differences = predictive_predictor.predict(pair_features)
+        predictor_enabled_current = (
+            args.predictive_use_predictions
+            and predictor_ready_current
+            and predictor_quality_passed
+        )
+        predicted_pair_differences = candidate_pair_differences.copy()
+        if not predictor_enabled_current:
+            predicted_pair_differences.fill(0.0)
+        corrected_pair_differences, observed_pair_differences = (
+            audit_correct_pair_differences(
+                predicted_pair_differences,
+                audited_pair_ids,
+                observed_scores,
+                audit_probability=audit_probability,
             )
         )
-        output_scores = jnp.asarray(output_scores_np)
-        token_generation_time = time.time() - start_time
-        fitness_time = 0.0
-        gather_time = 0.0
+        output_scores = jnp.asarray(
+            pair_differences_to_member_utilities(
+                corrected_pair_differences,
+                physical_population=args.total_parallel_generations,
+                virtual_population=args.virtual_total_parallel_generations,
+                reward_scale=frozen_reward_scale,
+            )
+        )
+        prediction_time = time.time() - start_time
+        reported_scores = observed_scores
     else:
+        indices_np = np.repeat(
+            np.asarray(train_indices, dtype=np.int32), args.generations_per_prompt
+        )
+        batch_prompts_np = np.repeat(
+            unique_prompts_np, args.generations_per_prompt, axis=0
+        )
+        indices = shard_on_data(indices_np)
+        batch_prompts = shard_on_data(batch_prompts_np)
         thread_idxes = (
-            all_thread_idxes
+            physical_thread_idxes
             if USE_SHARD_MAP
             else jnp.arange(args.total_parallel_generations, dtype=jnp.int32)
         )
+        if epoch == 0:
+            print("generating batch")
+        start_time = time.time()
         output_batch = jax.block_until_ready(
             generate_batch(noiser_params, params, batch_prompts, thread_idxes, epoch)
         )
         token_generation_time = time.time() - start_time
+        _maybe_log_outputs(epoch, output_batch, batch_prompts)
 
-        if (
-            args.track
-            and args.log_output_every > 0
-            and (epoch % args.log_output_every == 0)
-            and jax.process_index() == 0
-        ):
-            # Take a small sample from the first local shard to minimize overhead
-            K = min(8, args.total_parallel_generations)
-
-            if USE_SHARD_MAP:
-                local_gen = np.array(output_batch.addressable_shards[0].data)[:K]
-                local_prompts = np.array(batch_prompts.addressable_shards[0].data)[:K]
-            else:
-                local_gen = np.array(output_batch)[:K]
-                local_prompts = np.array(batch_prompts)[:K]
-
-            rows = []
-            for i in range(local_gen.shape[0]):
-                prompt_txt = safe_decode(local_prompts[i], tokenizer)
-                gen_txt = safe_decode(local_gen[i], tokenizer)
-                rows.append([epoch, i, prompt_txt, gen_txt])
-
-            table = wandb.Table(columns=["epoch", "sample_id", "prompt", "generation"], rows=rows)
-            wandb.log({"text_samples": table}, step=epoch)
-            
-            epoch_dir = run_out_dir / f"epoch_{epoch:05d}"
-            epoch_dir.mkdir(parents=True, exist_ok=True)
-            csv_path = epoch_dir / f"outputs_rank{args.proc_id}.csv"
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["epoch", "global_idx", "prompt", "generation"])
-                writer.writerows(rows)
-        
         start_time = time.time()
-        if epoch == 0:
-            print("calculating fitness")
         if USE_SHARD_MAP:
-            _local_fitness = [
+            local_shards = [
                 jax.device_put(
                     Task.get_batch_fitness(
-                        jax.device_put(shard1.data, jax.local_devices(backend="cpu")[0]),
-                        jax.device_put(shard2.data, jax.local_devices(backend="cpu")[0]),
+                        jax.device_put(
+                            index_shard.data, jax.local_devices(backend="cpu")[0]
+                        ),
+                        jax.device_put(
+                            output_shard.data, jax.local_devices(backend="cpu")[0]
+                        ),
                     ),
-                    shard1.device,
+                    index_shard.device,
                 )
-                for shard1, shard2 in zip(indices.addressable_shards, output_batch.addressable_shards)
+                for index_shard, output_shard in zip(
+                    indices.addressable_shards, output_batch.addressable_shards
+                )
             ]
             local_fitness = jax.make_array_from_single_device_arrays(
-                (args.total_parallel_generations,), NamedSharding(mesh, P("data")), _local_fitness
+                (args.total_parallel_generations,),
+                NamedSharding(mesh, P("data")),
+                local_shards,
             )
         else:
-            idx_cpu = jax.device_put(indices, jax.local_devices(backend="cpu")[0])
-            out_cpu = jax.device_put(output_batch, jax.local_devices(backend="cpu")[0])
             local_fitness = jax.device_put(
-                Task.get_batch_fitness(idx_cpu, out_cpu), jax.local_devices()[0]
+                Task.get_batch_fitness(
+                    jax.device_put(indices, jax.local_devices(backend="cpu")[0]),
+                    jax.device_put(output_batch, jax.local_devices(backend="cpu")[0]),
+                ),
+                jax.local_devices()[0],
             )
-
         fitness_time = time.time() - start_time
 
         start_time = time.time()
-        if epoch == 0:
-            print("gathering")
-        output_scores = process_allgather(local_fitness, True) if USE_SHARD_MAP else local_fitness
+        output_scores = (
+            process_allgather(local_fitness, True) if USE_SHARD_MAP else local_fitness
+        )
         if USE_SHARD_MAP:
-            output_scores = jax.sharding.reshard(output_scores, NamedSharding(mesh, P("data")))
+            output_scores = jax.sharding.reshard(
+                output_scores, NamedSharding(mesh, P("data"))
+            )
         gather_time = time.time() - start_time
-    start_time = time.time()
+        reported_scores = np.asarray(jax.device_get(output_scores), dtype=np.float32)
+
     if epoch == 0:
         print("updating params")
+    start_time = time.time()
     noiser_params, params, parameter_differences = jax.block_until_ready(
         do_update(noiser_params, params, output_scores, epoch)
     )
     parameter_update_time = time.time() - start_time
 
-    if ADAPTIVE_SURROGATE_MODE:
-        rollout_member_count = int(2 * rollout_pair_count)
-        surrogate_member_count = int(2 * surrogate_pair_count)
-        measured_trust_score = 0.0
-        if rollout_pair_ids.size:
-            observed_pair_differences = observed_member_fitness_to_pair_differences(
-                rollout_scores
-            )
-            audited_predictions = predicted_pair_differences[rollout_pair_ids]
-            measured_trust_score = compute_trust_score(
-                audited_predictions, observed_pair_differences
-            )
-            surrogate_predictor.update(
-                pair_features[rollout_pair_ids],
-                pair_prompt_ids[rollout_pair_ids],
-                observed_pair_differences,
-            )
-        next_surrogate_trust_alpha = min(
-            measured_trust_score, float(args.surrogate_max_fraction)
+    if PREDICTIVE_MODE:
+        audited_predictions = candidate_pair_differences[audited_pair_ids]
+        audit_mse = float(
+            np.mean((audited_predictions - observed_pair_differences) ** 2)
         )
-        surrogate_stats = {
-            "surrogate_fraction_used": float(surrogate_pair_count)
-            / float(args.total_pairs),
-            "surrogate_pairs": surrogate_pair_count,
-            "rollout_pairs": rollout_pair_count,
-            "surrogate_members": surrogate_member_count,
-            "rollout_members": rollout_member_count,
-            "surrogate_trust_alpha_used": float(surrogate_trust_alpha),
-            "surrogate_trust_alpha_next": float(next_surrogate_trust_alpha),
-            "surrogate_trust_score": float(measured_trust_score),
-            "surrogate_feature_time": feature_time,
-            "surrogate_predictor_observations": surrogate_predictor.total_observations,
+        zero_mse = float(np.mean(observed_pair_differences**2))
+        residual_ratio = (
+            audit_mse / zero_mse if zero_mse > 1e-12 else float("nan")
+        )
+        if (
+            observed_pair_differences.size > 1
+            and np.std(audited_predictions) > 1e-8
+            and np.std(observed_pair_differences) > 1e-8
+        ):
+            audit_correlation = float(
+                np.corrcoef(audited_predictions, observed_pair_differences)[0, 1]
+            )
+        else:
+            audit_correlation = 0.0
+        nonzero = observed_pair_differences != 0.0
+        nonzero_count = int(np.count_nonzero(nonzero))
+        sign_accuracy = float(
+            np.mean(
+                np.sign(audited_predictions[nonzero])
+                == np.sign(observed_pair_differences[nonzero])
+            )
+        ) if np.any(nonzero) else 0.0
+
+        # This update occurs strictly after the model update, so current labels
+        # can only affect the next ES iteration.
+        start_time = time.time()
+        predictive_predictor.update(
+            pair_features[audited_pair_ids],
+            observed_pair_differences,
+            rms_features=pair_features,
+        )
+        predictive_predictor.update_reward_scale(observed_scores)
+        predictor_fit_time = time.time() - start_time
+        predictor_quality_passed_next = bool(
+            args.predictive_use_predictions
+            and predictive_predictor.ready
+            and np.isfinite(residual_ratio)
+            and residual_ratio < args.predictive_max_residual_ratio
+            and nonzero_count >= args.predictive_min_quality_nonzero_labels
+        )
+        predictive_stats = {
+            "physical_population": args.total_parallel_generations,
+            "virtual_population": args.virtual_total_parallel_generations,
+            "audit_probability": audit_probability,
+            "predictor_reward_scale": frozen_reward_scale,
+            "predictor_reward_scale_next": predictive_predictor.reward_scale,
+            "audited_pairs": audited_pair_ids.size,
+            "preview_pairs_evaluated": preview_pair_ids.size,
+            "preview_only_pairs": preview_pair_ids.size - audited_pair_ids.size,
+            "preview_time": preview_time,
+            "prediction_time": prediction_time,
+            "predictor_fit_time": predictor_fit_time,
+            "predictor_observations": predictive_predictor.total_observations,
+            "predictor_effective_observations": predictive_predictor.effective_observations,
+            "predictor_ready_current": float(predictor_ready_current),
+            "predictor_ready_next": float(predictive_predictor.ready),
+            "predictor_enabled_current": float(predictor_enabled_current),
+            "predictor_enabled_next": float(predictor_quality_passed_next),
+            "predictor_candidate_rms": float(
+                np.sqrt(np.mean(candidate_pair_differences**2))
+            ),
+            "predictor_used_rms": float(
+                np.sqrt(np.mean(predicted_pair_differences**2))
+            ),
+            "predictor_audit_mse": audit_mse,
+            "predictor_zero_mse": zero_mse,
+            "predictor_residual_ratio": residual_ratio,
+            "predictor_audit_r2_vs_zero": 1.0 - residual_ratio,
+            "predictor_audit_correlation": audit_correlation,
+            "predictor_nonzero_labels": nonzero_count,
+            "predictor_nonzero_label_fraction": nonzero_count
+            / observed_pair_differences.size,
+            "predictor_nonzero_sign_accuracy": sign_accuracy,
+            "predictor_corrected_rms": float(
+                np.sqrt(np.mean(corrected_pair_differences**2))
+            ),
+            "preview_feature_zero_fraction": float(np.mean(pair_features == 0.0)),
+            "predictor_feature_rms_min": float(predictive_predictor.feature_rms.min()),
+            "predictor_feature_rms_max": float(predictive_predictor.feature_rms.max()),
         }
         print(
-            f"Epoch {epoch} fitness mix: rollout_members={rollout_member_count}, "
-            f"surrogate_members={surrogate_member_count}, "
-            f"trust_used={surrogate_trust_alpha:.3f}, "
-            f"trust_score={measured_trust_score:.3f}, "
-            f"trust_next={next_surrogate_trust_alpha:.3f}"
+            f"Epoch {epoch} predictive audit: labels={audited_pair_ids.size}, "
+            f"total_labels={predictive_predictor.total_observations}, "
+            f"residual_ratio={residual_ratio:.3f}, corr={audit_correlation:.3f}, "
+            f"enabled_next={predictor_quality_passed_next}, "
+            f"preview={preview_time:.2f}s, rollout={token_generation_time:.2f}s"
         )
+    else:
+        predictor_quality_passed_next = predictor_quality_passed
 
-    # print("CURRENT MEMORY start of stats", jax.local_devices()[0].memory_stats())
-    # parameter_differences = jax.tree.map(lambda x, y:jnp.mean(jnp.abs(x-y)), params, updated_params)
-    lora_updates = jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == LORA else 0.0, parameter_differences, es_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == LORA else 0.0, es_map))
-    nonlora_updates = jax.tree.reduce(operator.add, jax.tree.map(lambda x, y: x if y == FULL else 0.0, parameter_differences, es_map)) / jax.tree.reduce(operator.add, jax.tree.map(lambda y: 1.0 if y == FULL else 0.0, es_map))
+    lora_updates = jax.tree.reduce(
+        operator.add,
+        jax.tree.map(
+            lambda x, y: x if y == LORA else 0.0, parameter_differences, es_map
+        ),
+    ) / jax.tree.reduce(
+        operator.add, jax.tree.map(lambda y: 1.0 if y == LORA else 0.0, es_map)
+    )
+    nonlora_updates = jax.tree.reduce(
+        operator.add,
+        jax.tree.map(
+            lambda x, y: x if y == FULL else 0.0, parameter_differences, es_map
+        ),
+    ) / jax.tree.reduce(
+        operator.add, jax.tree.map(lambda y: 1.0 if y == FULL else 0.0, es_map)
+    )
 
-    # params = updated_params
-
-    true_train_fitness_sum += jnp.sum(output_scores).item()
-
+    reported_scores_jax = jnp.asarray(reported_scores)
+    true_train_fitness_sum += float(np.sum(reported_scores))
     stats = {
-        "avg_fitness": jnp.mean(output_scores),
-        "std_fitness": jnp.std(output_scores),
-        "max_fitness": jnp.max(output_scores),
-        "min_fitness": jnp.min(output_scores),
-        "median_fitness": jnp.median(output_scores),
+        "avg_fitness": jnp.mean(reported_scores_jax),
+        "std_fitness": jnp.std(reported_scores_jax),
+        "max_fitness": jnp.max(reported_scores_jax),
+        "min_fitness": jnp.min(reported_scores_jax),
+        "median_fitness": jnp.median(reported_scores_jax),
         "lora_updates": lora_updates,
         "nonlora_updates": nonlora_updates,
-        # "total_lora_updates": total_lora_updates,
-        # "total_nonlora_updates": total_nonlora_updates,
         "prompt_preproc_time": prompt_processing_time,
         "token_gen_time": token_generation_time,
         "fitness_time": fitness_time,
         "gather_time": gather_time,
         "update_time": parameter_update_time,
-        "true_train_avg_fitness": true_train_fitness_sum / ((epoch + 1) * args.total_parallel_generations)
+        "true_train_avg_fitness": true_train_fitness_sum
+        / ((epoch + 1) * args.total_parallel_generations),
     }
-    stats.update(surrogate_stats)
+    stats.update(predictive_stats)
 
     if validation_score is not None:
         stats["validation_score"] = validation_score
@@ -780,37 +1004,58 @@ def single_epoch(noiser_params, params, true_train_fitness_sum, epoch, surrogate
             f.write(f"{epoch},{float(hellaswag_score)},{elapsed:.3f}\n")
 
     with open(fitness_csv_path, "a", encoding="utf-8") as f:
-        f.write(f"{epoch},{float(jnp.mean(output_scores))}\n")
-    if ADAPTIVE_SURROGATE_MODE:
-        with open(surrogate_csv_path, "a", encoding="utf-8") as f:
+        f.write(f"{epoch},{float(jnp.mean(reported_scores_jax))}\n")
+    if PREDICTIVE_MODE:
+        with open(predictive_csv_path, "a", encoding="utf-8") as f:
             f.write(
-                f"{epoch},{surrogate_stats['rollout_members']},"
-                f"{surrogate_stats['surrogate_members']},"
-                f"{surrogate_stats['surrogate_trust_alpha_used']:.6f},"
-                f"{surrogate_stats['surrogate_trust_score']:.6f},"
-                f"{surrogate_stats['surrogate_trust_alpha_next']:.6f}\n"
+                f"{epoch},{predictive_stats['predictor_observations']},"
+                f"{predictive_stats['predictor_audit_mse']:.8f},"
+                f"{predictive_stats['predictor_zero_mse']:.8f},"
+                f"{predictive_stats['predictor_residual_ratio']:.8f},"
+                f"{predictive_stats['predictor_audit_correlation']:.8f},"
+                f"{predictive_stats['predictor_nonzero_labels']},"
+                f"{int(predictive_stats['predictor_enabled_current'])},"
+                f"{int(predictive_stats['predictor_enabled_next'])},"
+                f"{predictive_stats['predictor_reward_scale']:.8f},"
+                f"{predictive_stats['predictor_reward_scale_next']:.8f},"
+                f"{preview_time:.6f},{token_generation_time:.6f},"
+                f"{prediction_time:.6f},{predictor_fit_time:.6f},"
+                f"{parameter_update_time:.6f}\n"
             )
-    
+
     if args.track and jax.process_index() == 0:
         run.log(stats)
     else:
-        print(f"Mean fitness: {jnp.mean(output_scores)}; std fitness: {jnp.std(output_scores)}; max fitness: {jnp.max(output_scores)}; min fitness: {jnp.min(output_scores)}; median fitness: {jnp.median(output_scores)}")
+        print(
+            f"Mean fitness: {jnp.mean(reported_scores_jax)}; "
+            f"std fitness: {jnp.std(reported_scores_jax)}; "
+            f"max fitness: {jnp.max(reported_scores_jax)}; "
+            f"min fitness: {jnp.min(reported_scores_jax)}; "
+            f"median fitness: {jnp.median(reported_scores_jax)}"
+        )
         print("mean parameter diffs")
         print("Lora modules:", lora_updates)
         print("Full modules:", nonlora_updates)
         print("Stats:")
-        for k in stats:
-            print(f"\t{k}: {stats[k]}")
+        for key, value in stats.items():
+            print(f"\t{key}: {value}")
 
-    return noiser_params, params, true_train_fitness_sum, next_surrogate_trust_alpha
+    return (
+        noiser_params,
+        params,
+        true_train_fitness_sum,
+        predictor_quality_passed_next,
+    )
 
 with open(validation_csv_path, "w", encoding="utf-8") as f:
     f.write("epoch,validation_score,time_seconds\n")
-if ADAPTIVE_SURROGATE_MODE:
-    with open(surrogate_csv_path, "w", encoding="utf-8") as f:
+if PREDICTIVE_MODE:
+    with open(predictive_csv_path, "w", encoding="utf-8") as f:
         f.write(
-            "epoch,rollout_members,surrogate_members,"
-            "trust_alpha_used,trust_score,trust_alpha_next\n"
+            "epoch,predictor_observations,audit_mse,zero_mse,residual_ratio,"
+            "audit_correlation,nonzero_labels,predictor_enabled_current,"
+            "predictor_enabled_next,reward_scale,reward_scale_next,preview_time,"
+            "rollout_time,prediction_time,predictor_fit_time,update_time\n"
         )
 if hellaswag_validate is not None:
     with open(hellaswag_csv_path, "w", encoding="utf-8") as f:
@@ -841,8 +1086,17 @@ for epoch in tqdm.trange(args.num_epochs):
     if budget is not None and (time.time() - run_start_time) >= budget:
         print(f"Time budget ({budget}s) reached before epoch {epoch}. Stopping.")
         break
-    noiser_params, params, true_train_fitness_sum, surrogate_trust_alpha = single_epoch(
-        noiser_params, params, true_train_fitness_sum, epoch, surrogate_trust_alpha
+    (
+        noiser_params,
+        params,
+        true_train_fitness_sum,
+        predictor_quality_passed,
+    ) = single_epoch(
+        noiser_params,
+        params,
+        true_train_fitness_sum,
+        epoch,
+        predictor_quality_passed,
     )
     budget = _effective_time_budget_seconds()
     if budget is not None and (time.time() - run_start_time) >= budget:

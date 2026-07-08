@@ -578,7 +578,7 @@ class Qwen35RWKV(LLM):
         kernel = config["linear_conv_kernel_dim"]
         cache_len = int(config.get("attn_cache_len", 4096))
         dtype = params["embed_tokens"]["weight"].dtype
-        return {
+        state = {
             "linear_conv": jnp.zeros((n_linear, conv_dim, kernel - 1), dtype=dtype),
             "linear_recurrent": jnp.zeros(
                 (n_linear, num_v_heads, head_k_dim, head_v_dim), dtype=dtype
@@ -587,6 +587,12 @@ class Qwen35RWKV(LLM):
             "full_v_cache": jnp.zeros((n_full, cache_len, num_kv_heads, full_head_dim), dtype=dtype),
             "position": jnp.array(0, dtype=jnp.int32),
         }
+        preview_layers = tuple(config.get("preview_layers", ()))
+        if preview_layers:
+            state["preview_hidden"] = jnp.zeros(
+                (len(preview_layers), config["hidden_size"]), dtype=jnp.float32
+            )
+        return state
 
     @classmethod
     def embed(cls, common_params, tokens):
@@ -619,6 +625,10 @@ class Qwen35RWKV(LLM):
 
         layer_types = cfg["layer_types"]
         n_layers = len(layer_types)
+        preview_layers = tuple(cfg.get("preview_layers", ()))
+        preview_layer_slots = {
+            layer: slot for slot, layer in enumerate(preview_layers)
+        }
 
         linear_layer_to_idx = {layer: i for i, layer in enumerate(linear_indices)}
         full_layer_to_idx = {layer: i for i, layer in enumerate(full_indices)}
@@ -630,13 +640,16 @@ class Qwen35RWKV(LLM):
             x_t = token[None, :]
 
             def _reset_state(s):
-                return s | {
+                reset = {
                     "linear_conv": jnp.zeros_like(s["linear_conv"]),
                     "linear_recurrent": jnp.zeros_like(s["linear_recurrent"]),
                     "full_k_cache": jnp.zeros_like(s["full_k_cache"]),
                     "full_v_cache": jnp.zeros_like(s["full_v_cache"]),
                     "position": jnp.array(0, dtype=jnp.int32),
                 }
+                if preview_layers:
+                    reset["preview_hidden"] = jnp.zeros_like(s["preview_hidden"])
+                return s | reset
 
             curr_state = jax.lax.cond(restart, _reset_state, lambda s: s, curr_state)
             pos = curr_state["position"]
@@ -706,6 +719,18 @@ class Qwen35RWKV(LLM):
                 x_t = call_submodule(Qwen35RMSNorm, "post_attention_layernorm", block_common, x_t, eps)
                 x_t = call_submodule(Qwen35MLP, "mlp", block_common, x_t)
                 x_t = residual + x_t
+
+                if layer in preview_layer_slots:
+                    slot = preview_layer_slots[layer]
+                    old_hidden = curr_state["preview_hidden"][slot]
+                    captured_hidden = jnp.where(
+                        pos == length - 1, x_t[0].astype(jnp.float32), old_hidden
+                    )
+                    curr_state = curr_state | {
+                        "preview_hidden": curr_state["preview_hidden"]
+                        .at[slot]
+                        .set(captured_hidden)
+                    }
 
             curr_state = curr_state | {"position": curr_state["position"] + 1}
             return curr_state, x_t[0]

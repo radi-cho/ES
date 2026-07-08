@@ -20,6 +20,61 @@ def as_named(x, mesh, spec):
 def fold_in_helper(key, epoch, true_thread_idx):
     return jax.random.fold_in(jax.random.fold_in(key, epoch), true_thread_idx)
 
+
+def countsketch_antithetic_hidden_states(
+    hidden_states,
+    sigma,
+    bucket_ids,
+    bucket_signs,
+    *,
+    num_buckets=128,
+    center_rms_floor=1e-6,
+):
+    """Map adjacent +/- prompt states to center-normalized CountSketch blocks.
+
+    ``hidden_states`` has shape ``[2 * pairs, layers, hidden]`` with each
+    positive member immediately followed by its negative member. Bucket IDs
+    and signs have shape ``[layers, hidden]``; independent rows therefore give
+    each captured layer an independent fixed sketch.
+    """
+
+    hidden_states = jnp.asarray(hidden_states)
+    bucket_ids = jnp.asarray(bucket_ids, dtype=jnp.int32)
+    bucket_signs = jnp.asarray(bucket_signs, dtype=jnp.float32)
+    if hidden_states.ndim != 3 or hidden_states.shape[0] % 2:
+        raise ValueError("hidden_states must have shape [2 * pairs, layers, hidden]")
+    if bucket_ids.shape != hidden_states.shape[1:]:
+        raise ValueError("bucket_ids must have shape [layers, hidden]")
+    if bucket_signs.shape != bucket_ids.shape:
+        raise ValueError("bucket_signs must match bucket_ids")
+    if num_buckets < 1 or center_rms_floor <= 0.0:
+        raise ValueError("num_buckets and center_rms_floor must be positive")
+
+    pairs = hidden_states.reshape(
+        hidden_states.shape[0] // 2, 2, *hidden_states.shape[1:]
+    ).astype(jnp.float32)
+    positive, negative = pairs[:, 0], pairs[:, 1]
+    center = 0.5 * (positive + negative)
+    center_rms = jnp.sqrt(jnp.mean(jnp.square(center), axis=-1, keepdims=True))
+    direction = (positive - negative) / (
+        2.0
+        * jnp.asarray(sigma, dtype=jnp.float32)
+        * jnp.maximum(center_rms, jnp.asarray(center_rms_floor, jnp.float32))
+    )
+
+    def sketch_layer(layer_values, layer_buckets, layer_signs):
+        def sketch_row(values):
+            return jnp.zeros((num_buckets,), dtype=jnp.float32).at[
+                layer_buckets
+            ].add(values * layer_signs)
+
+        return jax.vmap(sketch_row)(layer_values)
+
+    blocks = jax.vmap(
+        sketch_layer, in_axes=(1, 0, 0), out_axes=1
+    )(direction, bucket_ids, bucket_signs)
+    return blocks.reshape((blocks.shape[0], -1))
+
 def safe_decode(tokens, tokenizer):
     try:
         stop_tokens = np.flatnonzero(tokens==0)
@@ -67,6 +122,90 @@ def build_generate_thread(MODEL, NOISER, frozen_noiser_params, config, base_evo_
         return out_tokens
 
     return generate_thread
+
+
+def build_preview_pair_thread(
+    MODEL,
+    NOISER,
+    frozen_noiser_params,
+    config,
+    base_evo_keys,
+    preview_layers,
+    prompt_width,
+    bucket_ids,
+    bucket_signs,
+    num_buckets=128,
+    center_rms_floor=1e-6,
+):
+    """Build one global pair's hidden-only prefill and CountSketch feature."""
+
+    preview_layers = tuple(int(layer) for layer in preview_layers)
+    n_layers = len(config["layer_types"])
+    if not preview_layers or len(set(preview_layers)) != len(preview_layers):
+        raise ValueError("preview_layers must contain distinct layer indices")
+    if any(layer < 0 or layer >= n_layers for layer in preview_layers):
+        raise ValueError("preview layer index is outside the model")
+    if prompt_width < 1:
+        raise ValueError("prompt_width must be positive")
+    bucket_ids = jnp.asarray(bucket_ids, dtype=jnp.int32)
+    bucket_signs = jnp.asarray(bucket_signs, dtype=jnp.float32)
+    expected_sketch_shape = (len(preview_layers), int(config["hidden_size"]))
+    if bucket_ids.shape != expected_sketch_shape:
+        raise ValueError(
+            f"bucket_ids must have shape {expected_sketch_shape}"
+        )
+    if bucket_signs.shape != expected_sketch_shape:
+        raise ValueError(
+            f"bucket_signs must have shape {expected_sketch_shape}"
+        )
+    preview_config = {
+        **config,
+        "attn_cache_len": int(prompt_width),
+        "preview_layers": preview_layers,
+    }
+
+    def preview_pair(
+        noiser_params,
+        params,
+        prompt,
+        prompt_length,
+        global_pair_id,
+        epoch_num,
+    ):
+        global_member_ids = (
+            2 * jnp.asarray(global_pair_id, dtype=jnp.int32)
+            + jnp.arange(2, dtype=jnp.int32)
+        )
+
+        def preview_member(global_member_id):
+            iterinfo = (epoch_num, global_member_id)
+            init_state = MODEL.default_state(params, preview_config)
+            _, final_state = MODEL.forward(
+                NOISER,
+                frozen_noiser_params,
+                noiser_params,
+                preview_config,
+                params,
+                base_evo_keys,
+                iterinfo,
+                prompt,
+                init_state,
+                length=prompt_length,
+                return_hidden=True,
+            )
+            return final_state["preview_hidden"]
+
+        pair_hidden = jax.vmap(preview_member)(global_member_ids)
+        return countsketch_antithetic_hidden_states(
+            pair_hidden,
+            noiser_params["sigma"],
+            bucket_ids,
+            bucket_signs,
+            num_buckets=num_buckets,
+            center_rms_floor=center_rms_floor,
+        )[0]
+
+    return preview_pair
 
 
 def build_generate_sft_thread(MODEL, NOISER, frozen_noiser_params, config, base_evo_keys, master_gen_key, temperature=1.0):

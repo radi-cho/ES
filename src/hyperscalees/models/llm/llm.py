@@ -88,7 +88,15 @@ class LLM(Model):
         raise NotImplementedError("Forward sequence is not implemented")
 
     @classmethod
-    def _forward(cls, common_params, tokens, state, length=None, new_starts=None):
+    def _forward(
+        cls,
+        common_params,
+        tokens,
+        state,
+        length=None,
+        new_starts=None,
+        return_hidden=False,
+    ):
         """
         Forward pass on a single stream of tokens
         """
@@ -100,5 +108,7 @@ class LLM(Model):
         if new_starts is None:
             new_starts = jnp.zeros((T,), dtype=jnp.bool)
         x, state = cls.forward_seq(common_params, x, state, length, new_starts)
+        if return_hidden:
+            return x, state
         x = cls.outhead(common_params, x)
         return x, state
