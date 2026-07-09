@@ -383,6 +383,7 @@ def collect(args: Args) -> None:
     import jax
     import jax.numpy as jnp
     from huggingface_hub.constants import HF_HOME
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from tqdm.auto import tqdm
 
     jax.config.update(
@@ -713,6 +714,11 @@ def collect(args: Args) -> None:
     print(f"Expected predictor input payload: {row_count * hidden_size * 4 / 1024**3:.2f} GiB")
     print(f"Output directory: {output_directory}")
 
+    replica_mesh = Mesh(np.asarray(gpu_devices), ("replica",))
+    replicated_sharding = NamedSharding(replica_mesh, P())
+    params = jax.tree.map(
+        lambda value: jax.device_put(value, replicated_sharding), params
+    )
     master_key = jax.random.key(args.seed)
     base_model_key = jax.random.fold_in(master_key, 0)
     base_gen_key = jax.random.fold_in(master_key, 1)
