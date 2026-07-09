@@ -31,6 +31,10 @@ the generated token sequences, source examples, an immutable run config, and
 a manifest. A prompt is committed only after all its arrays have been flushed.
 Running the same command again resumes incomplete prompts.
 
+When multiple GPUs are visible, complete antithetic pairs are split evenly
+across them. The default launcher exposes GPUs 0 and 1, so the 64 trajectories
+for each prompt run as 32 members per device while preserving global pair IDs.
+
 Do not randomly split the 196,608 rows: all 24 rows from a prompt/pair share
 one label. Split by `sample_id` from `row_index.npy`.
 

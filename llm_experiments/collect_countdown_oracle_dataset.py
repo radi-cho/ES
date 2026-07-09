@@ -171,6 +171,17 @@ def expand_row_labels(pair_rewards: np.ndarray, num_layers: int) -> np.ndarray:
     return np.repeat(pair_labels, num_layers, axis=0)
 
 
+def shard_member_ids(member_ids: np.ndarray, num_devices: int) -> np.ndarray:
+    """Split ordered complete antithetic pairs evenly across local devices."""
+
+    member_ids = np.asarray(member_ids, dtype=np.int32)
+    if member_ids.ndim != 1 or member_ids.size == 0 or member_ids.size % 2:
+        raise ValueError("member_ids must be a nonempty vector of complete pairs")
+    if num_devices < 1 or (member_ids.size // 2) % num_devices:
+        raise ValueError("antithetic pairs must divide evenly across local GPUs")
+    return member_ids.reshape(num_devices, member_ids.size // num_devices)
+
+
 def _open_memmap(
     path: Path,
     *,
@@ -386,11 +397,15 @@ def collect(args: Args) -> None:
     from hyperscalees.noiser.eggroll import EggRoll
     from llm_experiments.utils import build_generate_batch_with_preview
 
-    gpu_devices = [device for device in jax.devices() if device.platform == "gpu"]
-    if len(gpu_devices) != 1:
-        raise RuntimeError(f"Expected exactly one visible GPU, found {jax.devices()}")
-    device = gpu_devices[0]
-    print(f"Using JAX device: {device}")
+    gpu_devices = [device for device in jax.local_devices() if device.platform == "gpu"]
+    if not gpu_devices:
+        raise RuntimeError(f"Expected at least one visible GPU, found {jax.local_devices()}")
+    num_devices = len(gpu_devices)
+    if args.directions_per_prompt % num_devices:
+        raise ValueError(
+            "directions_per_prompt must divide evenly across visible GPUs"
+        )
+    print(f"Using {num_devices} JAX GPU(s): {gpu_devices}")
 
     output_directory.mkdir(parents=True, exist_ok=True)
     repo_root = Path(__file__).resolve().parents[1]
@@ -698,7 +713,6 @@ def collect(args: Args) -> None:
     print(f"Expected predictor input payload: {row_count * hidden_size * 4 / 1024**3:.2f} GiB")
     print(f"Output directory: {output_directory}")
 
-    params = jax.tree.map(lambda value: jax.device_put(value, device), params)
     master_key = jax.random.key(args.seed)
     base_model_key = jax.random.fold_in(master_key, 0)
     base_gen_key = jax.random.fold_in(master_key, 1)
@@ -726,16 +740,24 @@ def collect(args: Args) -> None:
         center_rms_floor=args.center_rms_floor,
     )
     member_count = 2 * args.directions_per_prompt
+    members_per_device = member_count // num_devices
+    parallel_generate = jax.pmap(
+        fused_generate,
+        in_axes=(None, None, None, None, 0, None),
+        devices=gpu_devices,
+    )
     print(
-        f"Compiling the fused {member_count}-way rollout + hidden-capture kernel..."
+        f"Compiling {members_per_device} members/GPU across {num_devices} GPU(s)..."
     )
     compile_start = time.time()
-    compiled_generate = jax.jit(fused_generate).lower(
+    compiled_generate = parallel_generate.lower(
         noiser_params,
         params,
         jax.ShapeDtypeStruct((args.generation_length,), jnp.dtype("int32")),
         jax.ShapeDtypeStruct((), jnp.dtype("int32")),
-        jax.ShapeDtypeStruct((member_count,), jnp.dtype("int32")),
+        jax.ShapeDtypeStruct(
+            (num_devices, members_per_device), jnp.dtype("int32")
+        ),
         jnp.asarray(0, dtype=jnp.int32),
     ).compile()
     print(f"Compilation finished in {time.time() - compile_start:.1f}s")
@@ -751,7 +773,9 @@ def collect(args: Args) -> None:
         "started_or_resumed_at": _utc_now(),
         "run_config_sha256": run_config_sha256,
         "git": git_metadata,
-        "device": str(device),
+        "devices": [str(device) for device in gpu_devices],
+        "device_count": num_devices,
+        "members_per_device": members_per_device,
         "completed_samples": initial_completed,
         "total_samples": args.dataset_size,
     }
@@ -782,15 +806,19 @@ def collect(args: Args) -> None:
                     params,
                     jnp.asarray(prompts[sample_id]),
                     jnp.asarray(prompt_lengths[sample_id], dtype=jnp.int32),
-                    jnp.asarray(member_ids),
+                    jnp.asarray(shard_member_ids(member_ids, num_devices)),
                     jnp.asarray(0, dtype=jnp.int32),
                 )
             )
-            tokens_np = np.asarray(jax.device_get(generated_tokens), dtype=np.int32)
-            inputs_np = np.asarray(jax.device_get(pair_inputs), dtype=np.float32)
+            tokens_np = np.asarray(
+                jax.device_get(generated_tokens), dtype=np.int32
+            ).reshape(member_count, args.generation_length)
+            inputs_np = np.asarray(
+                jax.device_get(pair_inputs), dtype=np.float32
+            ).reshape(args.directions_per_prompt, num_layers, hidden_size)
             center_rms_np = np.asarray(
                 jax.device_get(pair_center_rms), dtype=np.float32
-            )
+            ).reshape(args.directions_per_prompt, num_layers)
             if tokens_np.shape != (member_count, args.generation_length):
                 raise RuntimeError(f"Unexpected generated-token shape {tokens_np.shape}")
             expected_input_shape = (

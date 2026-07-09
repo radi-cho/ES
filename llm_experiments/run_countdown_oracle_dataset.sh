@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEFAULT_PYTHON="/home/siana/HyperscaleES_v2_308c579/.venv/bin/python"
+DEFAULT_PYTHON="$REPO_ROOT/.venv/bin/python"
 VENV_PYTHON="${VENV_PYTHON:-$DEFAULT_PYTHON}"
 OUTPUT_DIRECTORY="${OUTPUT_DIRECTORY:-$REPO_ROOT/outputs/countdown_oracle_q35_2b_D256_P32_seed0}"
 
@@ -13,7 +13,7 @@ fi
 
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 cd "$REPO_ROOT"
 exec "$VENV_PYTHON" -m llm_experiments.collect_countdown_oracle_dataset \

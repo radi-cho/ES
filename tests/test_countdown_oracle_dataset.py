@@ -19,6 +19,7 @@ from llm_experiments.collect_countdown_oracle_dataset import (
     _already_complete,
     build_row_index,
     expand_row_labels,
+    shard_member_ids,
     zero_padded_prompt_lengths,
 )
 from llm_experiments.utils import build_generate_batch_with_preview
@@ -136,6 +137,16 @@ def test_row_index_and_raw_fitness_labels_are_traceable():
 def test_prompt_lengths_use_only_trailing_zero_padding():
     prompts = np.asarray([[4, 5, 0, 0], [7, 8, 9, 0]], dtype=np.int32)
     npt.assert_array_equal(zero_padded_prompt_lengths(prompts), [2, 3])
+
+
+def test_member_sharding_keeps_complete_pairs_and_global_order():
+    members = np.arange(64, dtype=np.int32)
+    sharded = shard_member_ids(members, 2)
+    assert sharded.shape == (2, 32)
+    npt.assert_array_equal(sharded.reshape(-1), members)
+    npt.assert_array_equal(sharded[:, 0] % 2, 0)
+    with npt.assert_raises(ValueError):
+        shard_member_ids(members, 3)
 
 
 def test_resume_refuses_committed_samples_without_run_config():
