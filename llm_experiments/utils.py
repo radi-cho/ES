@@ -21,6 +21,50 @@ def fold_in_helper(key, epoch, true_thread_idx):
     return jax.random.fold_in(jax.random.fold_in(key, epoch), true_thread_idx)
 
 
+def antithetic_hidden_state_statistics(
+    hidden_states,
+    sigma,
+    *,
+    center_rms_floor=1e-6,
+):
+    """Return normalized differences and center RMS for adjacent +/- members."""
+
+    hidden_states = jnp.asarray(hidden_states)
+    if hidden_states.ndim != 3 or hidden_states.shape[0] % 2:
+        raise ValueError("hidden_states must have shape [2 * pairs, layers, hidden]")
+    if center_rms_floor <= 0.0:
+        raise ValueError("center_rms_floor must be positive")
+
+    pairs = hidden_states.reshape(
+        hidden_states.shape[0] // 2, 2, *hidden_states.shape[1:]
+    ).astype(jnp.float32)
+    positive, negative = pairs[:, 0], pairs[:, 1]
+    center = 0.5 * (positive + negative)
+    center_rms = jnp.sqrt(jnp.mean(jnp.square(center), axis=-1, keepdims=True))
+    normalized = (positive - negative) / (
+        2.0
+        * jnp.asarray(sigma, dtype=jnp.float32)
+        * jnp.maximum(center_rms, jnp.asarray(center_rms_floor, jnp.float32))
+    )
+    return normalized, center_rms[..., 0]
+
+
+def normalize_antithetic_hidden_states(
+    hidden_states,
+    sigma,
+    *,
+    center_rms_floor=1e-6,
+):
+    """Return center-normalized hidden differences for adjacent +/- members."""
+
+    normalized, _ = antithetic_hidden_state_statistics(
+        hidden_states,
+        sigma,
+        center_rms_floor=center_rms_floor,
+    )
+    return normalized
+
+
 def countsketch_antithetic_hidden_states(
     hidden_states,
     sigma,
@@ -50,16 +94,10 @@ def countsketch_antithetic_hidden_states(
     if num_buckets < 1 or center_rms_floor <= 0.0:
         raise ValueError("num_buckets and center_rms_floor must be positive")
 
-    pairs = hidden_states.reshape(
-        hidden_states.shape[0] // 2, 2, *hidden_states.shape[1:]
-    ).astype(jnp.float32)
-    positive, negative = pairs[:, 0], pairs[:, 1]
-    center = 0.5 * (positive + negative)
-    center_rms = jnp.sqrt(jnp.mean(jnp.square(center), axis=-1, keepdims=True))
-    direction = (positive - negative) / (
-        2.0
-        * jnp.asarray(sigma, dtype=jnp.float32)
-        * jnp.maximum(center_rms, jnp.asarray(center_rms_floor, jnp.float32))
+    direction = normalize_antithetic_hidden_states(
+        hidden_states,
+        sigma,
+        center_rms_floor=center_rms_floor,
     )
 
     def sketch_layer(layer_values, layer_buckets, layer_signs):
@@ -122,6 +160,160 @@ def build_generate_thread(MODEL, NOISER, frozen_noiser_params, config, base_evo_
         return out_tokens
 
     return generate_thread
+
+
+def build_generate_batch_with_preview(
+    MODEL,
+    NOISER,
+    frozen_noiser_params,
+    config,
+    base_evo_keys,
+    master_gen_key,
+    preview_layers,
+    *,
+    temperature=0.0,
+    suppress_eos_token=None,
+    center_rms_floor=1e-6,
+):
+    """Build a fused rollout/all-layer-preview kernel for one shared prompt.
+
+    The returned function evaluates adjacent antithetic members and returns
+    their complete token sequences, normalized hidden difference, and center
+    RMS at the final forced prompt token. Prompt-prefix calls bypass the LM
+    head; the key is still advanced exactly as in :func:`build_generate_thread`.
+    """
+
+    preview_layers = tuple(int(layer) for layer in preview_layers)
+    num_layers = len(config["layer_types"])
+    if not preview_layers or len(set(preview_layers)) != len(preview_layers):
+        raise ValueError("preview_layers must contain distinct layer indices")
+    if any(layer < 0 or layer >= num_layers for layer in preview_layers):
+        raise ValueError("preview layer index is outside the model")
+
+    preview_config = {**config, "preview_layers": preview_layers}
+    decode_config = dict(config)
+    decode_config.pop("preview_layers", None)
+
+    def generate_batch(
+        noiser_params,
+        params,
+        prompt,
+        prompt_length,
+        member_ids,
+        epoch_num,
+    ):
+        batch_size = member_ids.shape[0]
+        if batch_size % 2:
+            raise ValueError("member_ids must contain complete antithetic pairs")
+
+        initial_state = MODEL.default_state(params, preview_config)
+        states = jax.tree.map(
+            lambda value: jnp.broadcast_to(value, (batch_size,) + value.shape),
+            initial_state,
+        )
+        tokens = jnp.zeros((batch_size,), dtype=jnp.int32)
+        generation_keys = jax.vmap(
+            lambda member_id: fold_in_helper(
+                master_gen_key, epoch_num, member_id
+            )
+        )(member_ids)
+
+        def prefix_only(input_tokens, input_states, input_keys):
+            """Advance model state without computing unused prompt logits."""
+
+            def one(input_token, input_state, member_id):
+                _, output_state = MODEL.forward(
+                    NOISER,
+                    frozen_noiser_params,
+                    noiser_params,
+                    decode_config,
+                    params,
+                    base_evo_keys,
+                    (epoch_num, member_id),
+                    input_token,
+                    input_state,
+                    length=prompt_length,
+                    return_hidden=True,
+                )
+                return output_state
+
+            output_states = jax.vmap(one)(input_tokens, input_states, member_ids)
+            # The ordinary rollout splits once at every position, including
+            # forced-prefix positions whose sampled token is never consumed.
+            output_keys = jax.vmap(lambda key: jax.random.split(key)[0])(
+                input_keys
+            )
+            return tokens, output_states, output_keys
+
+        def forward_and_sample(step_config, input_tokens, input_states, input_keys):
+            def one(input_token, input_state, input_key, member_id):
+                next_key, sample_key = jax.random.split(input_key)
+                generated, output_state = MODEL.forward(
+                    NOISER,
+                    frozen_noiser_params,
+                    noiser_params,
+                    step_config,
+                    params,
+                    base_evo_keys,
+                    (epoch_num, member_id),
+                    input_token,
+                    input_state,
+                    length=prompt_length,
+                )
+                logits = generated[-1]
+                if suppress_eos_token is not None:
+                    logits = logits.at[suppress_eos_token].set(-jnp.inf)
+                if temperature == 0.0:
+                    sampled = jnp.argmax(logits)
+                else:
+                    sampled = jax.random.categorical(sample_key, logits / temperature)
+                return sampled, output_state, next_key
+
+            return jax.vmap(one)(input_tokens, input_states, input_keys, member_ids)
+
+        def scan_step(carry, step_input):
+            previous_tokens, input_states, input_keys = carry
+            step, prompt_token = step_input
+            true_inputs = jnp.where(prompt_token == 0, previous_tokens, prompt_token)
+
+            def prefix_branch(args):
+                return prefix_only(*args)
+
+            def head_branch(args):
+                def capture_branch(inner_args):
+                    return forward_and_sample(preview_config, *inner_args)
+
+                def decode_branch(inner_args):
+                    return forward_and_sample(decode_config, *inner_args)
+
+                return jax.lax.cond(
+                    step == prompt_length - 1,
+                    capture_branch,
+                    decode_branch,
+                    args,
+                )
+
+            output_carry = jax.lax.cond(
+                step < prompt_length - 1,
+                prefix_branch,
+                head_branch,
+                (true_inputs, input_states, input_keys),
+            )
+            return output_carry, true_inputs
+
+        (_, final_states, _), output_tokens = jax.lax.scan(
+            scan_step,
+            (tokens, states, generation_keys),
+            (jnp.arange(prompt.shape[0], dtype=jnp.int32), prompt),
+        )
+        pair_inputs, center_rms = antithetic_hidden_state_statistics(
+            final_states["preview_hidden"],
+            noiser_params["sigma"],
+            center_rms_floor=center_rms_floor,
+        )
+        return jnp.swapaxes(output_tokens, 0, 1), pair_inputs, center_rms
+
+    return generate_batch
 
 
 def build_preview_pair_thread(
