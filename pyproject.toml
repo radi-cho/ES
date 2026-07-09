@@ -60,3 +60,11 @@ dependencies = [
     "math-verify",
     "antlr4-python3-runtime==4.9.*", 
 ]
+
+[project.optional-dependencies]
+oracle-analysis = [
+    "joblib",
+    "numpy",
+    "scikit-learn",
+    "scipy",
+]
