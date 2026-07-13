@@ -15,6 +15,8 @@ import numpy.testing as npt
 from llm_experiments.utils import (
     build_preview_pair_thread,
     countsketch_antithetic_hidden_states,
+    sketch_summary_antithetic_hidden_states,
+    summarize_antithetic_hidden_states,
 )
 
 
@@ -57,6 +59,56 @@ def test_countsketch_central_difference_and_swap_antisymmetry():
     npt.assert_allclose(feature, [[-2.0, 6.0, -2.5, 1.0]], atol=1e-6)
     npt.assert_allclose(swapped, -feature, atol=1e-6)
     npt.assert_array_equal(zero, np.zeros_like(zero))
+
+
+def test_signed_hidden_summaries_are_finite_and_swap_antisymmetric():
+    sigma = 0.25
+    base = jnp.asarray(
+        [[2.0, -1.0, 0.5, 3.0], [1.5, 2.0, -2.0, 0.25]],
+        dtype=jnp.float32,
+    )
+    response = jnp.asarray(
+        [[0.5, -1.0, 2.0, 1.5], [-2.0, 0.25, 1.0, 3.0]],
+        dtype=jnp.float32,
+    )
+    hidden = jnp.stack((base + sigma * response, base - sigma * response))
+
+    feature = np.asarray(summarize_antithetic_hidden_states(hidden, sigma))
+    swapped = np.asarray(summarize_antithetic_hidden_states(hidden[::-1], sigma))
+    zero = np.asarray(
+        summarize_antithetic_hidden_states(jnp.stack((hidden[0], hidden[0])), sigma)
+    )
+
+    assert feature.shape == (1, 12)
+    assert np.all(np.isfinite(feature))
+    npt.assert_allclose(swapped, -feature, rtol=1e-6, atol=1e-6)
+    npt.assert_array_equal(zero, np.zeros_like(zero))
+
+
+def test_sketch_summary_appends_six_statistics_per_layer():
+    sigma = 0.5
+    base = jnp.ones((2, 4), dtype=jnp.float32)
+    response = jnp.asarray(
+        [[1.0, 2.0, -1.0, 0.5], [0.25, -0.5, 1.5, -2.0]],
+        dtype=jnp.float32,
+    )
+    hidden = jnp.stack((base + sigma * response, base - sigma * response))
+    buckets = jnp.asarray([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=jnp.int32)
+    signs = jnp.ones((2, 4), dtype=jnp.float32)
+
+    feature = np.asarray(
+        sketch_summary_antithetic_hidden_states(
+            hidden, sigma, buckets, signs, num_buckets=2
+        )
+    )
+    swapped = np.asarray(
+        sketch_summary_antithetic_hidden_states(
+            hidden[::-1], sigma, buckets, signs, num_buckets=2
+        )
+    )
+
+    assert feature.shape == (1, 4 + 12)
+    npt.assert_allclose(swapped, -feature, rtol=1e-6, atol=1e-6)
 
 
 class _FakePreviewModel:
@@ -140,6 +192,38 @@ def test_preview_pair_uses_global_pair_ids_and_returns_sketch_only():
     # Pair 3 must use global members 6/7, making its synthetic response 4x
     # pair 0 (global members 0/1). Local microbatch IDs would fail this check.
     npt.assert_allclose(pair_three, 4.0 * pair_zero, rtol=2e-5, atol=2e-5)
+
+
+def test_preview_pair_can_append_structured_summaries():
+    buckets = np.asarray([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.int32)
+    signs = np.ones((2, 4), dtype=np.float32)
+    preview_pair = build_preview_pair_thread(
+        _FakePreviewModel,
+        object(),
+        {},
+        {"layer_types": ["x", "x"], "hidden_size": 4},
+        {},
+        (0, 1),
+        3,
+        buckets,
+        signs,
+        num_buckets=2,
+        feature_kind="sketch_summary",
+    )
+    compiled = jax.jit(preview_pair)
+    feature = np.asarray(
+        compiled(
+            {"sigma": jnp.asarray(0.01, dtype=jnp.float32)},
+            {},
+            jnp.asarray([7, 8, 0], dtype=jnp.int32),
+            2,
+            0,
+            5,
+        )
+    )
+
+    assert feature.shape == (16,)
+    assert np.all(np.isfinite(feature))
 
 
 class PreviewFeatureTest(unittest.TestCase):

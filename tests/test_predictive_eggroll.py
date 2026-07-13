@@ -18,8 +18,10 @@ from hyperscalees.noiser.predictive_eggroll import (
     PredictiveEggRoll,
     audit_correct_pair_differences,
     make_countsketch,
+    make_online_surrogate,
     pair_differences_to_member_utilities,
     pair_ids_to_member_ids,
+    prompt_center_features,
     sample_stratified_audit_pairs,
 )
 
@@ -269,6 +271,131 @@ def test_countsketch_is_fixed_reproducible_and_layer_independent():
     assert first_buckets.min() >= 0
     assert first_buckets.max() < 128
     npt.assert_array_equal(np.unique(first_signs), [-1.0, 1.0])
+
+
+def test_prompt_centering_keeps_groups_separate_and_removes_offsets():
+    features = np.asarray(
+        [
+            [11.0, 2.0],
+            [13.0, 4.0],
+            [15.0, 6.0],
+            [-7.0, 10.0],
+            [-5.0, 12.0],
+            [-3.0, 14.0],
+        ],
+        dtype=np.float32,
+    )
+    centered = prompt_center_features(
+        features, num_prompts=2, pairs_per_prompt=3
+    ).reshape(2, 3, 2)
+
+    npt.assert_allclose(np.mean(centered, axis=1), 0.0, atol=1e-7)
+    npt.assert_allclose(centered[0, :, 0], [-2.0, 0.0, 2.0])
+    npt.assert_allclose(centered[1, :, 0], [-2.0, 0.0, 2.0])
+
+    shifted = features.copy()
+    shifted[:3] += np.asarray([100.0, -50.0], dtype=np.float32)
+    shifted[3:] += np.asarray([-20.0, 80.0], dtype=np.float32)
+    npt.assert_allclose(
+        prompt_center_features(shifted, num_prompts=2, pairs_per_prompt=3),
+        centered.reshape(6, 2),
+        atol=1e-6,
+    )
+
+
+def test_surrogate_factory_exposes_ridge_and_rejects_unknown_models():
+    predictor = make_online_surrogate("ridge", feature_dim=2)
+    assert isinstance(predictor, OnlineRidgeSurrogate)
+    with npt.assert_raises_regex(ValueError, "unknown predictive surrogate"):
+        make_online_surrogate("mlp", feature_dim=2)
+
+
+def test_prequential_calibration_is_lagged_shrunk_and_bounded():
+    predictor = OnlineRidgeSurrogate(
+        feature_dim=1,
+        ridge=0.01,
+        min_observations=1,
+        prediction_clip=10.0,
+        calibration_decay=1.0,
+        calibration_max_scale=1.0,
+        calibration_min_observations=2,
+        calibration_prior_observations=2.0,
+        calibrate_predictions=True,
+    )
+    predictor.update(
+        np.asarray([[1.0]], dtype=np.float32),
+        np.asarray([1.0], dtype=np.float32),
+        rms_features=np.asarray([[1.0]], dtype=np.float32),
+    )
+    evaluation = np.asarray([[1.0], [-1.0]], dtype=np.float32)
+    current, raw = predictor.predict_with_uncalibrated(evaluation)
+
+    # No audited prediction/label pairs have calibrated this fitted model yet.
+    assert predictor.calibration_scale == 0.0
+    npt.assert_array_equal(current, np.zeros(2, dtype=np.float32))
+    assert raw[0] > 0.0
+
+    predictor.update(
+        evaluation,
+        np.asarray([1.0, -1.0], dtype=np.float32),
+        rms_features=evaluation,
+        evaluated_predictions=current,
+        evaluated_uncalibrated_predictions=raw,
+    )
+
+    # The just-produced current array remains frozen; only later calls use the
+    # positive, confidence-shrunk calibration coefficient.
+    npt.assert_array_equal(current, np.zeros(2, dtype=np.float32))
+    assert 0.0 < predictor.calibration_confidence < 1.0
+    assert 0.0 < predictor.calibration_scale < 1.0
+    later = predictor.predict(evaluation)
+    assert later[0] > 0.0
+    npt.assert_allclose(later[0], -later[1], atol=1e-7)
+
+
+def test_negative_prequential_covariance_disables_control_term():
+    predictor = OnlineRidgeSurrogate(
+        feature_dim=1,
+        min_observations=0,
+        calibration_min_observations=2,
+        calibration_prior_observations=0.0,
+        calibrate_predictions=True,
+    )
+    features = np.asarray([[1.0], [-1.0]], dtype=np.float32)
+    raw = np.asarray([1.0, -1.0], dtype=np.float32)
+    predictor.update(
+        features,
+        np.asarray([-1.0, 1.0], dtype=np.float32),
+        rms_features=features,
+        evaluated_predictions=np.zeros(2, dtype=np.float32),
+        evaluated_uncalibrated_predictions=raw,
+    )
+
+    assert predictor.calibration_slope == 0.0
+    assert predictor.calibration_scale == 0.0
+
+
+def test_zero_prequential_predictions_do_not_create_calibration_confidence():
+    predictor = OnlineRidgeSurrogate(
+        feature_dim=1,
+        min_observations=0,
+        calibration_min_observations=1,
+        calibration_prior_observations=0.0,
+        calibrate_predictions=True,
+    )
+    features = np.asarray([[1.0], [-1.0]], dtype=np.float32)
+    zeros = np.zeros(2, dtype=np.float32)
+    predictor.update(
+        features,
+        np.asarray([1.0, -1.0], dtype=np.float32),
+        rms_features=features,
+        evaluated_predictions=zeros,
+        evaluated_uncalibrated_predictions=zeros,
+    )
+
+    assert predictor.calibration_observations == 0
+    assert predictor.calibration_effective_observations == 0.0
+    assert predictor.calibration_scale == 0.0
 
 
 def test_ridge_gate_no_intercept_symmetric_clipping_and_decay():

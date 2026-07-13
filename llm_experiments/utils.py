@@ -113,6 +113,95 @@ def countsketch_antithetic_hidden_states(
     )(direction, bucket_ids, bucket_signs)
     return blocks.reshape((blocks.shape[0], -1))
 
+
+def summarize_antithetic_hidden_states(
+    hidden_states,
+    sigma,
+    *,
+    center_rms_floor=1e-6,
+    feature_clip=10.0,
+):
+    """Return six cheap signed response statistics for every captured layer.
+
+    Unlike an absolute hidden representation, every statistic is odd under
+    swapping the positive and negative members.  The summaries retain global
+    response shape that a bucketed sketch can discard, while adding no model
+    forward work and only a handful of reductions over the hidden dimension.
+    """
+
+    values = jnp.asarray(hidden_states)
+    if values.ndim != 3 or values.shape[0] % 2:
+        raise ValueError("hidden_states must have shape [2 * pairs, layers, hidden]")
+    if feature_clip <= 0.0:
+        raise ValueError("feature_clip must be positive")
+    direction, _ = antithetic_hidden_state_statistics(
+        values,
+        sigma,
+        center_rms_floor=center_rms_floor,
+    )
+    pairs = values.reshape(values.shape[0] // 2, 2, *values.shape[1:]).astype(
+        jnp.float32
+    )
+    center = 0.5 * (pairs[:, 0] + pairs[:, 1])
+    center_rms = jnp.sqrt(jnp.mean(jnp.square(center), axis=-1, keepdims=True))
+    center_unit_rms = center / jnp.maximum(
+        center_rms, jnp.asarray(center_rms_floor, dtype=jnp.float32)
+    )
+    direction_rms = jnp.sqrt(
+        jnp.maximum(jnp.mean(jnp.square(direction), axis=-1, keepdims=True), 1e-12)
+    )
+    standardized_direction = jnp.clip(
+        direction / direction_rms,
+        -jnp.asarray(feature_clip, dtype=jnp.float32),
+        jnp.asarray(feature_clip, dtype=jnp.float32),
+    )
+
+    summaries = jnp.stack(
+        (
+            jnp.mean(direction * center_unit_rms, axis=-1),
+            jnp.mean(direction, axis=-1),
+            0.5 * (
+                jnp.max(direction, axis=-1) + jnp.min(direction, axis=-1)
+            ),
+            jnp.mean(jnp.sign(direction), axis=-1),
+            jnp.mean(jnp.power(standardized_direction, 3), axis=-1),
+            jnp.mean(direction * jnp.sign(center_unit_rms), axis=-1),
+        ),
+        axis=-1,
+    )
+    return jnp.clip(summaries, -feature_clip, feature_clip).reshape(
+        (summaries.shape[0], -1)
+    )
+
+
+def sketch_summary_antithetic_hidden_states(
+    hidden_states,
+    sigma,
+    bucket_ids,
+    bucket_signs,
+    *,
+    num_buckets=128,
+    center_rms_floor=1e-6,
+    summary_clip=10.0,
+):
+    """Concatenate the PR5 CountSketch with signed layer summaries."""
+
+    sketch = countsketch_antithetic_hidden_states(
+        hidden_states,
+        sigma,
+        bucket_ids,
+        bucket_signs,
+        num_buckets=num_buckets,
+        center_rms_floor=center_rms_floor,
+    )
+    summary = summarize_antithetic_hidden_states(
+        hidden_states,
+        sigma,
+        center_rms_floor=center_rms_floor,
+        feature_clip=summary_clip,
+    )
+    return jnp.concatenate((sketch, summary), axis=-1)
+
 def safe_decode(tokens, tokenizer):
     try:
         stop_tokens = np.flatnonzero(tokens==0)
@@ -328,8 +417,9 @@ def build_preview_pair_thread(
     bucket_signs,
     num_buckets=128,
     center_rms_floor=1e-6,
+    feature_kind="sketch",
 ):
-    """Build one global pair's hidden-only prefill and CountSketch feature."""
+    """Build one global pair's hidden-only prefill feature."""
 
     preview_layers = tuple(int(layer) for layer in preview_layers)
     n_layers = len(config["layer_types"])
@@ -339,6 +429,8 @@ def build_preview_pair_thread(
         raise ValueError("preview layer index is outside the model")
     if prompt_width < 1:
         raise ValueError("prompt_width must be positive")
+    if feature_kind not in ("sketch", "sketch_summary"):
+        raise ValueError("feature_kind must be 'sketch' or 'sketch_summary'")
     bucket_ids = jnp.asarray(bucket_ids, dtype=jnp.int32)
     bucket_signs = jnp.asarray(bucket_signs, dtype=jnp.float32)
     expected_sketch_shape = (len(preview_layers), int(config["hidden_size"]))
@@ -388,7 +480,12 @@ def build_preview_pair_thread(
             return final_state["preview_hidden"]
 
         pair_hidden = jax.vmap(preview_member)(global_member_ids)
-        return countsketch_antithetic_hidden_states(
+        feature_fn = (
+            countsketch_antithetic_hidden_states
+            if feature_kind == "sketch"
+            else sketch_summary_antithetic_hidden_states
+        )
+        return feature_fn(
             pair_hidden,
             noiser_params["sigma"],
             bucket_ids,

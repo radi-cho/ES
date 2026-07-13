@@ -7,6 +7,8 @@ a Horvitz--Thompson residual keeps the raw ES update unbiased.
 
 from __future__ import annotations
 
+from typing import Protocol
+
 import numpy as np
 
 from .eggroll import EggRoll
@@ -76,6 +78,32 @@ def pair_ids_to_member_ids(pair_ids: np.ndarray) -> np.ndarray:
     return np.stack((2 * pair_ids, 2 * pair_ids + 1), axis=-1).reshape(-1).astype(
         np.int32
     )
+
+
+def prompt_center_features(
+    features: np.ndarray,
+    *,
+    num_prompts: int,
+    pairs_per_prompt: int,
+) -> np.ndarray:
+    """Remove prompt-local feature means without mixing prompt groups.
+
+    The virtual directions for every prompt are contiguous.  Centering only
+    across those directions removes prompt-specific common mode while keeping
+    the feature map independent of both the audit sample and rollout labels.
+    """
+
+    values = np.asarray(features, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError("features must have shape [pairs, features]")
+    if num_prompts < 1 or pairs_per_prompt < 1:
+        raise ValueError("num_prompts and pairs_per_prompt must be positive")
+    if values.shape[0] != num_prompts * pairs_per_prompt:
+        raise ValueError("feature rows do not match the prompt layout")
+    grouped = values.reshape(num_prompts, pairs_per_prompt, values.shape[1])
+    prompt_means = np.mean(grouped, axis=1, keepdims=True, dtype=np.float64)
+    centered = grouped - prompt_means
+    return centered.reshape(values.shape).astype(np.float32, copy=False)
 
 
 def audit_correct_pair_differences(
@@ -172,6 +200,52 @@ def make_countsketch(
     return buckets, signs
 
 
+class OnlineSurrogate(Protocol):
+    """Small interface separating the training loop from the oracle model."""
+
+    feature_dim: int
+    total_observations: int
+    feature_rms: np.ndarray
+    reward_scale: float
+    calibration_observations: int
+
+    @property
+    def ready(self) -> bool: ...
+
+    @property
+    def effective_observations(self) -> float: ...
+
+    @property
+    def calibration_scale(self) -> float: ...
+
+    @property
+    def calibration_slope(self) -> float: ...
+
+    @property
+    def calibration_confidence(self) -> float: ...
+
+    @property
+    def prequential_residual_ratio(self) -> float: ...
+
+    def predict(self, raw_features: np.ndarray) -> np.ndarray: ...
+
+    def predict_with_uncalibrated(
+        self, raw_features: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]: ...
+
+    def update(
+        self,
+        audited_features: np.ndarray,
+        targets: np.ndarray,
+        *,
+        rms_features: np.ndarray,
+        evaluated_predictions: np.ndarray | None = None,
+        evaluated_uncalibrated_predictions: np.ndarray | None = None,
+    ) -> None: ...
+
+    def update_reward_scale(self, observed_member_rewards: np.ndarray) -> None: ...
+
+
 class OnlineRidgeSurrogate:
     """Task-level ridge probe with lagged RMS and decayed raw statistics.
 
@@ -192,6 +266,11 @@ class OnlineRidgeSurrogate:
         initial_reward_scale: float = 0.5,
         reward_scale_decay: float = 0.9,
         minimum_reward_scale: float = 0.1,
+        calibration_decay: float = 0.9,
+        calibration_max_scale: float = 1.0,
+        calibration_min_observations: int = 32,
+        calibration_prior_observations: float = 64.0,
+        calibrate_predictions: bool = False,
     ):
         if feature_dim < 1:
             raise ValueError("feature_dim must be positive")
@@ -207,6 +286,14 @@ class OnlineRidgeSurrogate:
             raise ValueError("reward scales must be positive")
         if not 0.0 <= reward_scale_decay <= 1.0:
             raise ValueError("reward_scale_decay must be in [0, 1]")
+        if not 0.0 < calibration_decay <= 1.0:
+            raise ValueError("calibration_decay must be in (0, 1]")
+        if calibration_max_scale <= 0.0:
+            raise ValueError("calibration_max_scale must be positive")
+        if calibration_min_observations < 0:
+            raise ValueError("calibration_min_observations must be nonnegative")
+        if calibration_prior_observations < 0.0:
+            raise ValueError("calibration_prior_observations must be nonnegative")
 
         self.feature_dim = int(feature_dim)
         self.ridge = float(ridge)
@@ -219,6 +306,11 @@ class OnlineRidgeSurrogate:
         )
         self.reward_scale_decay = float(reward_scale_decay)
         self.minimum_reward_scale = float(minimum_reward_scale)
+        self.calibration_decay = float(calibration_decay)
+        self.calibration_max_scale = float(calibration_max_scale)
+        self.calibration_min_observations = int(calibration_min_observations)
+        self.calibration_prior_observations = float(calibration_prior_observations)
+        self.calibrate_predictions = bool(calibrate_predictions)
 
         self.gram = np.zeros((feature_dim, feature_dim), dtype=np.float64)
         self.cross = np.zeros(feature_dim, dtype=np.float64)
@@ -228,6 +320,16 @@ class OnlineRidgeSurrogate:
         self.feature_rms = np.ones(feature_dim, dtype=np.float64)
         self.weights = np.zeros(feature_dim, dtype=np.float64)
         self.total_observations = 0
+        # These statistics consume only predictions made before their labels
+        # were observed.  They therefore provide lagged scale calibration and
+        # a stable prequential quality gate without training on the current
+        # update's outcomes.
+        self.calibration_cross = 0.0
+        self.calibration_prediction_square = 0.0
+        self.calibration_observations = 0
+        self.calibration_effective_observations = 0.0
+        self.quality_residual_square = 0.0
+        self.quality_target_square = 0.0
 
     def _features(self, features: np.ndarray) -> np.ndarray:
         features = np.asarray(features, dtype=np.float64)
@@ -245,8 +347,64 @@ class OnlineRidgeSurrogate:
     def effective_observations(self) -> float:
         return self.label_weight
 
-    def predict(self, raw_features: np.ndarray) -> np.ndarray:
-        """Predict with weights and RMS frozen from previous iterations."""
+    @property
+    def calibration_scale(self) -> float:
+        if not self.calibrate_predictions:
+            return 1.0
+        if (
+            self.calibration_observations < self.calibration_min_observations
+            or self.calibration_prediction_square <= 1e-12
+        ):
+            return 0.0
+        slope = np.clip(
+            self.calibration_cross / self.calibration_prediction_square,
+            0.0,
+            self.calibration_max_scale,
+        )
+        denominator = (
+            self.calibration_effective_observations
+            + self.calibration_prior_observations
+        )
+        confidence = (
+            self.calibration_effective_observations / denominator
+            if denominator > 0.0
+            else 1.0
+        )
+        return float(confidence * slope)
+
+    @property
+    def calibration_slope(self) -> float:
+        if self.calibration_prediction_square <= 1e-12:
+            return 0.0
+        return float(
+            np.clip(
+                self.calibration_cross / self.calibration_prediction_square,
+                0.0,
+                self.calibration_max_scale,
+            )
+        )
+
+    @property
+    def calibration_confidence(self) -> float:
+        denominator = (
+            self.calibration_effective_observations
+            + self.calibration_prior_observations
+        )
+        if denominator <= 0.0:
+            return 1.0
+        return float(self.calibration_effective_observations / denominator)
+
+    @property
+    def prequential_residual_ratio(self) -> float:
+        if (
+            self.calibration_observations < self.calibration_min_observations
+            or self.quality_target_square <= 1e-12
+        ):
+            return float("nan")
+        return float(self.quality_residual_square / self.quality_target_square)
+
+    def predict_uncalibrated(self, raw_features: np.ndarray) -> np.ndarray:
+        """Return the lagged ridge prediction before scalar shrinkage."""
 
         raw_features = self._features(raw_features)
         if not self.ready:
@@ -257,12 +415,30 @@ class OnlineRidgeSurrogate:
             predictions, -self.prediction_clip, self.prediction_clip
         ).astype(np.float32)
 
+    def predict_with_uncalibrated(
+        self, raw_features: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        uncalibrated = self.predict_uncalibrated(raw_features)
+        calibrated = np.clip(
+            self.calibration_scale * uncalibrated,
+            -self.prediction_clip,
+            self.prediction_clip,
+        ).astype(np.float32)
+        return calibrated, uncalibrated
+
+    def predict(self, raw_features: np.ndarray) -> np.ndarray:
+        """Predict with lagged weights, RMS, and prequential calibration."""
+
+        return self.predict_with_uncalibrated(raw_features)[0]
+
     def update(
         self,
         audited_features: np.ndarray,
         targets: np.ndarray,
         *,
         rms_features: np.ndarray,
+        evaluated_predictions: np.ndarray | None = None,
+        evaluated_uncalibrated_predictions: np.ndarray | None = None,
     ) -> None:
         """Update after the ES step; new state is used next iteration."""
 
@@ -273,6 +449,53 @@ class OnlineRidgeSurrogate:
             raise ValueError("targets have the wrong shape")
         if not np.all(np.isfinite(targets)):
             raise ValueError("targets must be finite")
+
+        if (evaluated_predictions is None) != (
+            evaluated_uncalibrated_predictions is None
+        ):
+            raise ValueError("both evaluated prediction arrays must be supplied")
+        if evaluated_predictions is not None:
+            evaluated_predictions = np.asarray(
+                evaluated_predictions, dtype=np.float64
+            )
+            evaluated_uncalibrated_predictions = np.asarray(
+                evaluated_uncalibrated_predictions, dtype=np.float64
+            )
+            expected = (audited_features.shape[0],)
+            if (
+                evaluated_predictions.shape != expected
+                or evaluated_uncalibrated_predictions.shape != expected
+            ):
+                raise ValueError("evaluated predictions have the wrong shape")
+            if not (
+                np.all(np.isfinite(evaluated_predictions))
+                and np.all(np.isfinite(evaluated_uncalibrated_predictions))
+            ):
+                raise ValueError("evaluated predictions must be finite")
+
+            decay = self.calibration_decay
+            self.calibration_cross *= decay
+            self.calibration_prediction_square *= decay
+            self.quality_residual_square *= decay
+            self.quality_target_square *= decay
+            self.calibration_effective_observations *= decay
+            prediction_square = float(
+                evaluated_uncalibrated_predictions
+                @ evaluated_uncalibrated_predictions
+            )
+            # A completely zero candidate carries no information about its
+            # useful scale.  Decay old evidence, but do not manufacture
+            # confidence merely because another zero vector was audited.
+            if prediction_square > 1e-12:
+                self.calibration_cross += float(
+                    evaluated_uncalibrated_predictions @ targets
+                )
+                self.calibration_prediction_square += prediction_square
+                residual = evaluated_predictions - targets
+                self.quality_residual_square += float(residual @ residual)
+                self.quality_target_square += float(targets @ targets)
+                self.calibration_observations += targets.size
+                self.calibration_effective_observations += targets.size
 
         self.gram *= self.decay
         self.cross *= self.decay
@@ -315,3 +538,11 @@ class OnlineRidgeSurrogate:
             self.reward_scale_decay * self.reward_scale
             + (1.0 - self.reward_scale_decay) * observed_scale,
         )
+
+
+def make_online_surrogate(kind: str, **kwargs) -> OnlineSurrogate:
+    """Construct the configured online oracle behind a stable interface."""
+
+    if kind == "ridge":
+        return OnlineRidgeSurrogate(**kwargs)
+    raise ValueError(f"unknown predictive surrogate: {kind!r}")

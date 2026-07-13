@@ -20,11 +20,12 @@ from hyperscalees.models.common import simple_es_tree_key
 
 from hyperscalees.noiser import all_noisers
 from hyperscalees.noiser.predictive_eggroll import (
-    OnlineRidgeSurrogate,
     audit_correct_pair_differences,
     make_countsketch,
+    make_online_surrogate,
     pair_differences_to_member_utilities,
     pair_ids_to_member_ids,
+    prompt_center_features,
     sample_stratified_audit_pairs,
 )
 from hyperscalees.environments.llm_bandits import all_tasks, validation_tasks
@@ -102,6 +103,9 @@ class Args:
     predictive_virtual_factor: int = 16
     predictive_preview_microbatch_pairs: int = 8
     predictive_sketch_size: int = 128
+    predictive_feature_kind: Literal["sketch", "sketch_summary"] = "sketch"
+    predictive_prompt_center: bool = False
+    predictive_surrogate: Literal["ridge"] = "ridge"
     predictive_ridge: float = 10.0
     predictive_decay: float = 0.99
     predictive_min_observations: int = 256
@@ -113,8 +117,14 @@ class Args:
     predictive_audit_seed: int = 1
     predictive_rms_floor: float = 1e-4
     predictive_use_predictions: bool = True
+    # Deprecated PR5 compatibility flags. PR6 replaces the one-step binary
+    # gate with continuously shrunk, lagged calibration.
     predictive_max_residual_ratio: float = 0.9
     predictive_min_quality_nonzero_labels: int = 4
+    predictive_calibration_decay: float = 0.9
+    predictive_calibration_max_scale: float = 1.0
+    predictive_calibration_min_observations: int = 32
+    predictive_calibration_prior_observations: float = 64.0
 
     train_dataset_size: Optional[int] = None
     val_dataset_size: Optional[int] = None
@@ -214,6 +224,14 @@ if PREDICTIVE_MODE:
         raise ValueError("predictive_minimum_reward_scale must be positive")
     if args.predictive_sketch_size < 1:
         raise ValueError("predictive_sketch_size must be positive")
+    if not 0.0 < args.predictive_calibration_decay <= 1.0:
+        raise ValueError("predictive_calibration_decay must be in (0, 1]")
+    if args.predictive_calibration_max_scale <= 0.0:
+        raise ValueError("predictive_calibration_max_scale must be positive")
+    if args.predictive_calibration_min_observations < 0:
+        raise ValueError("predictive_calibration_min_observations must be nonnegative")
+    if args.predictive_calibration_prior_observations < 0.0:
+        raise ValueError("predictive_calibration_prior_observations must be nonnegative")
     if args.predictive_max_residual_ratio <= 0.0:
         raise ValueError("predictive_max_residual_ratio must be positive")
     if args.predictive_min_quality_nonzero_labels < 1:
@@ -473,8 +491,14 @@ if PREDICTIVE_MODE:
         sketch_size=args.predictive_sketch_size,
         seed=args.predictive_feature_seed,
     )
-    feature_dim = 2 * args.predictive_sketch_size
-    predictive_predictor = OnlineRidgeSurrogate(
+    summary_dim = (
+        6 * len(preview_layers)
+        if args.predictive_feature_kind == "sketch_summary"
+        else 0
+    )
+    feature_dim = len(preview_layers) * args.predictive_sketch_size + summary_dim
+    predictive_predictor = make_online_surrogate(
+        args.predictive_surrogate,
         feature_dim=feature_dim,
         ridge=args.predictive_ridge,
         decay=args.predictive_decay,
@@ -484,6 +508,11 @@ if PREDICTIVE_MODE:
         initial_reward_scale=args.predictive_reward_scale,
         reward_scale_decay=args.predictive_reward_scale_decay,
         minimum_reward_scale=args.predictive_minimum_reward_scale,
+        calibration_decay=args.predictive_calibration_decay,
+        calibration_max_scale=args.predictive_calibration_max_scale,
+        calibration_min_observations=args.predictive_calibration_min_observations,
+        calibration_prior_observations=args.predictive_calibration_prior_observations,
+        calibrate_predictions=True,
     )
 
     preview_pair = build_preview_pair_thread(
@@ -498,12 +527,13 @@ if PREDICTIVE_MODE:
         countsketch_signs,
         num_buckets=args.predictive_sketch_size,
         center_rms_floor=args.predictive_rms_floor,
+        feature_kind=args.predictive_feature_kind,
     )
     print(
         "Compiling hidden-only preview batch:",
         f"pairs={args.predictive_preview_microbatch_pairs},",
         f"prompt_width={preview_prompt_width}, layers={preview_layers},",
-        f"features={feature_dim}",
+        f"feature_kind={args.predictive_feature_kind}, features={feature_dim}",
     )
     start_time = time.time()
     preview_feature_batch = jax.jit(
@@ -534,12 +564,13 @@ if PREDICTIVE_MODE:
         f"audit_probability={1.0 / args.predictive_virtual_factor:.4f},",
         f"audit_seed={args.predictive_audit_seed},",
         f"feature_seed={args.predictive_feature_seed},",
+        f"surrogate={args.predictive_surrogate},",
+        f"prompt_center={args.predictive_prompt_center},",
         f"initial_reward_scale={args.predictive_reward_scale},",
         f"warmup_labels={args.predictive_min_observations}",
     )
 
 true_train_fitness_sum = 0.0
-predictor_quality_passed = False
 
 FULL = 0
 LORA = 1
@@ -639,7 +670,6 @@ def single_epoch(
     params,
     true_train_fitness_sum,
     epoch,
-    predictor_quality_passed,
 ):
     validation_score = None
     hellaswag_score = None
@@ -723,10 +753,7 @@ def single_epoch(
         fitness_time = time.time() - start_time
 
         start_time = time.time()
-        pair_features = np.empty(
-            (total_virtual_pairs, 2 * args.predictive_sketch_size),
-            dtype=np.float32,
-        )
+        pair_features = np.empty((total_virtual_pairs, feature_dim), dtype=np.float32)
         # Every pair uses this exact same feature kernel.  In particular, the
         # feature/prediction cannot reveal whether a pair was selected for the
         # audit, which is required by the HT unbiasedness argument.
@@ -756,13 +783,23 @@ def single_epoch(
             )
         preview_time = time.time() - start_time
 
+        if args.predictive_prompt_center:
+            pair_features = prompt_center_features(
+                pair_features,
+                num_prompts=args.prompts_per_epoch,
+                pairs_per_prompt=virtual_pairs_per_prompt,
+            )
+
         start_time = time.time()
         predictor_ready_current = predictive_predictor.ready
-        candidate_pair_differences = predictive_predictor.predict(pair_features)
+        (
+            candidate_pair_differences,
+            uncalibrated_pair_differences,
+        ) = predictive_predictor.predict_with_uncalibrated(pair_features)
         predictor_enabled_current = (
             args.predictive_use_predictions
             and predictor_ready_current
-            and predictor_quality_passed
+            and predictive_predictor.calibration_scale > 0.0
         )
         predicted_pair_differences = candidate_pair_differences.copy()
         if not predictor_enabled_current:
@@ -895,15 +932,22 @@ def single_epoch(
             pair_features[audited_pair_ids],
             observed_pair_differences,
             rms_features=pair_features,
+            evaluated_predictions=(
+                audited_predictions if predictor_ready_current else None
+            ),
+            evaluated_uncalibrated_predictions=(
+                uncalibrated_pair_differences[audited_pair_ids]
+                if predictor_ready_current
+                else None
+            ),
         )
         predictive_predictor.update_reward_scale(observed_scores)
         predictor_fit_time = time.time() - start_time
-        predictor_quality_passed_next = bool(
+        rolling_residual_ratio = predictive_predictor.prequential_residual_ratio
+        predictor_enabled_next = bool(
             args.predictive_use_predictions
             and predictive_predictor.ready
-            and np.isfinite(residual_ratio)
-            and residual_ratio < args.predictive_max_residual_ratio
-            and nonzero_count >= args.predictive_min_quality_nonzero_labels
+            and predictive_predictor.calibration_scale > 0.0
         )
         predictive_stats = {
             "physical_population": args.total_parallel_generations,
@@ -922,7 +966,7 @@ def single_epoch(
             "predictor_ready_current": float(predictor_ready_current),
             "predictor_ready_next": float(predictive_predictor.ready),
             "predictor_enabled_current": float(predictor_enabled_current),
-            "predictor_enabled_next": float(predictor_quality_passed_next),
+            "predictor_enabled_next": float(predictor_enabled_next),
             "predictor_candidate_rms": float(
                 np.sqrt(np.mean(candidate_pair_differences**2))
             ),
@@ -933,6 +977,11 @@ def single_epoch(
             "predictor_zero_mse": zero_mse,
             "predictor_residual_ratio": residual_ratio,
             "predictor_audit_r2_vs_zero": 1.0 - residual_ratio,
+            "predictor_rolling_residual_ratio": rolling_residual_ratio,
+            "predictor_calibration_scale": predictive_predictor.calibration_scale,
+            "predictor_calibration_slope": predictive_predictor.calibration_slope,
+            "predictor_calibration_confidence": predictive_predictor.calibration_confidence,
+            "predictor_calibration_observations": predictive_predictor.calibration_observations,
             "predictor_audit_correlation": audit_correlation,
             "predictor_nonzero_labels": nonzero_count,
             "predictor_nonzero_label_fraction": nonzero_count
@@ -948,12 +997,13 @@ def single_epoch(
         print(
             f"Epoch {epoch} predictive audit: labels={audited_pair_ids.size}, "
             f"total_labels={predictive_predictor.total_observations}, "
-            f"residual_ratio={residual_ratio:.3f}, corr={audit_correlation:.3f}, "
-            f"enabled_next={predictor_quality_passed_next}, "
+            f"residual_ratio={residual_ratio:.3f}, "
+            f"rolling_ratio={rolling_residual_ratio:.3f}, "
+            f"calibration={predictive_predictor.calibration_scale:.3f}, "
+            f"corr={audit_correlation:.3f}, "
+            f"enabled_next={predictor_enabled_next}, "
             f"preview={preview_time:.2f}s, rollout={token_generation_time:.2f}s"
         )
-    else:
-        predictor_quality_passed_next = predictor_quality_passed
 
     lora_updates = jax.tree.reduce(
         operator.add,
@@ -1012,6 +1062,11 @@ def single_epoch(
                 f"{predictive_stats['predictor_audit_mse']:.8f},"
                 f"{predictive_stats['predictor_zero_mse']:.8f},"
                 f"{predictive_stats['predictor_residual_ratio']:.8f},"
+                f"{predictive_stats['predictor_rolling_residual_ratio']:.8f},"
+                f"{predictive_stats['predictor_calibration_scale']:.8f},"
+                f"{predictive_stats['predictor_calibration_slope']:.8f},"
+                f"{predictive_stats['predictor_calibration_confidence']:.8f},"
+                f"{predictive_stats['predictor_calibration_observations']},"
                 f"{predictive_stats['predictor_audit_correlation']:.8f},"
                 f"{predictive_stats['predictor_nonzero_labels']},"
                 f"{int(predictive_stats['predictor_enabled_current'])},"
@@ -1040,12 +1095,7 @@ def single_epoch(
         for key, value in stats.items():
             print(f"\t{key}: {value}")
 
-    return (
-        noiser_params,
-        params,
-        true_train_fitness_sum,
-        predictor_quality_passed_next,
-    )
+    return noiser_params, params, true_train_fitness_sum
 
 with open(validation_csv_path, "w", encoding="utf-8") as f:
     f.write("epoch,validation_score,time_seconds\n")
@@ -1053,6 +1103,8 @@ if PREDICTIVE_MODE:
     with open(predictive_csv_path, "w", encoding="utf-8") as f:
         f.write(
             "epoch,predictor_observations,audit_mse,zero_mse,residual_ratio,"
+            "rolling_residual_ratio,calibration_scale,calibration_slope,"
+            "calibration_confidence,calibration_observations,"
             "audit_correlation,nonzero_labels,predictor_enabled_current,"
             "predictor_enabled_next,reward_scale,reward_scale_next,preview_time,"
             "rollout_time,prediction_time,predictor_fit_time,update_time\n"
@@ -1086,17 +1138,11 @@ for epoch in tqdm.trange(args.num_epochs):
     if budget is not None and (time.time() - run_start_time) >= budget:
         print(f"Time budget ({budget}s) reached before epoch {epoch}. Stopping.")
         break
-    (
-        noiser_params,
-        params,
-        true_train_fitness_sum,
-        predictor_quality_passed,
-    ) = single_epoch(
+    noiser_params, params, true_train_fitness_sum = single_epoch(
         noiser_params,
         params,
         true_train_fitness_sum,
         epoch,
-        predictor_quality_passed,
     )
     budget = _effective_time_budget_seconds()
     if budget is not None and (time.time() - run_start_time) >= budget:
